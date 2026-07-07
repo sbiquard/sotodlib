@@ -1,5 +1,8 @@
 import numpy as np
 from scipy.optimize import curve_fit
+from scipy.interpolate import BSpline
+from scipy import sparse
+from scipy.linalg import LinAlgError, cholesky_banded, cho_solve_banded
 from lmfit import Model as LmfitModel
 from sotodlib import core, tod_ops
 from sotodlib.tod_ops import filters, apodize, fft_ops
@@ -567,6 +570,394 @@ def subtract_hwpss(aman, signal='signal', hwpss_template_name='hwpss_model',
     
     if remove_template:
         aman.move(hwpss_template_name, None)
+
+
+def _build_knot_vector(x, n_knots, degree=3):
+    """
+    Build a clamped (open-uniform) knot vector for a degree-`degree` B-spline
+    over the domain [x[0], x[-1]], with `n_knots` interior breakpoints.
+
+    The number of resulting B-spline basis functions is `n_knots + degree + 1`.
+    """
+    x_min, x_max = x[0], x[-1]
+    interior = np.linspace(x_min, x_max, n_knots + 2)[1:-1]
+    return np.pad(interior, degree + 1, mode='constant', constant_values=(x_min, x_max))
+
+
+def get_bspline_design_matrix(x, n_knots=None, samples_per_knot=4000, degree=3,
+                               min_knots=2, extrapolate=False):
+    """
+    Build the sparse local-support B-spline design matrix for sample
+    locations `x` (typically `aman.timestamps`).
+
+    Parameters
+    ----------
+    x : array-like
+        Non-decreasing 1-D sample locations (e.g. timestamps).
+    n_knots : int, optional
+        Number of interior knot breakpoints. If None, computed from
+        `samples_per_knot` as ``max(min_knots, len(x) // samples_per_knot)``.
+    samples_per_knot : int, optional
+        Used to auto-compute `n_knots` when not given explicitly. Default 4000.
+    degree : int, optional
+        B-spline degree. Default 3 (cubic).
+    min_knots : int, optional
+        Minimum number of interior knots when auto-computing `n_knots`. Default 2.
+    extrapolate : bool, optional
+        Whether to allow evaluating the basis outside [x[0], x[-1]]. Default
+        False, which raises if this is ever attempted (e.g. when rebuilding a
+        template on samples outside the domain the spline was originally fit on).
+
+    Returns
+    -------
+    B : sparse matrix, shape (len(x), n_bases)
+        The B-spline design matrix. Each row has at most `degree + 1` nonzero
+        entries (local support).
+    knots : ndarray, shape (n_bases + degree + 1,)
+        The full clamped knot vector, needed to re-evaluate the basis later.
+    """
+    x = np.asarray(x)
+    if n_knots is None:
+        n_knots = max(min_knots, len(x) // samples_per_knot)
+    knots = _build_knot_vector(x, n_knots, degree)
+    B = BSpline.design_matrix(x, knots, degree, extrapolate=extrapolate)
+    return B, knots
+
+
+def hwpss_spline_func(timestamps, hwp_angle, modes, coeffs, knots, degree=3,
+                       extrapolate=False):
+    """
+    Evaluate the B-spline x HWP-harmonic HWPSS template given per-detector,
+    per-(harmonic, spline-basis) coefficients.
+
+    Parameters
+    ----------
+    timestamps : array-like
+        Sample locations the spline basis is evaluated at.
+    hwp_angle : array-like
+        HWP angle at each sample.
+    modes : list of int
+        Harmonic modes, as in `harms_func`.
+    coeffs : ndarray, shape (n_dets, 2*len(modes), n_bases)
+        Per-detector spline coefficients for each sin/cos harmonic component.
+        `n_bases = len(knots) - degree - 1`.
+    knots : ndarray
+        Clamped knot vector, as returned by `get_bspline_design_matrix`.
+    degree : int, optional
+        B-spline degree used to build `knots`. Default 3.
+    extrapolate : bool, optional
+        See `get_bspline_design_matrix`. Default False.
+
+    Returns
+    -------
+    template : ndarray, shape (n_dets, n_samps)
+    """
+    B = BSpline.design_matrix(timestamps, knots, degree, extrapolate=extrapolate)
+    H = harms_func(hwp_angle, modes, coeffs=None)  # (2*n_modes, n_samps)
+    n_dets = coeffs.shape[0]
+    n_samps = len(timestamps)
+    template = np.zeros((n_dets, n_samps))
+    for c in range(2 * len(modes)):
+        Bc = B @ coeffs[:, c, :].T  # (n_samps, n_dets)
+        template += (Bc * H[c, :, None]).T
+    return template
+
+
+def _knot_major_design_matrix(B, H):
+    """
+    Build the B-spline x harmonic design matrix in "knot-major" column order
+    (index = j*n_harm + c, for basis index j and harmonic sin/cos index c).
+    """
+    n_harm = H.shape[0]
+    n_bases = B.shape[1]
+    blocks = [B.multiply(H[c][:, None]) for c in range(n_harm)]
+    A_mode_major = sparse.hstack(blocks, format='csr')
+    perm = np.array([j * n_harm + c for c in range(n_harm) for j in range(n_bases)])
+    inv_perm = np.empty_like(perm)
+    inv_perm[perm] = np.arange(n_harm * n_bases)
+    return A_mode_major[:, inv_perm].tocsr()
+
+
+def _solve_spline_coeffs(A, w, y, bandwidth, n_coeffs):
+    """
+    Solve the weighted normal equations ``(A^T diag(w) A) x = A^T diag(w) y``
+    for one or more detectors at once (`y` can be 1-D, for a single
+    detector, or (n_samps, n_dets), for several sharing the same weights
+    `w`), exploiting the banded structure of the normal matrix. Falls back
+    to a dense pseudo-inverse solve if the system is degenerate (e.g. a
+    knot span with no unflagged samples).
+
+    Parameters
+    ----------
+    A : sparse matrix, shape (n_samps, n_coeffs)
+        Design matrix in knot-major column order (see `_knot_major_design_matrix`).
+    w : ndarray, shape (n_samps,)
+    y : ndarray, shape (n_samps,) or (n_samps, n_dets)
+    bandwidth : int
+    n_coeffs : int
+
+    Returns
+    -------
+    coeffs : ndarray, shape (n_coeffs,) or (n_coeffs, n_dets)
+    n_degenerate : int
+        Number of coefficients with ~zero data support.
+    """
+    Aw = A.multiply(w[:, None])
+    N = (A.T @ Aw).tocoo()
+    RHS = np.asarray(Aw.T @ y)
+
+    mask = N.col >= N.row
+    rows, cols, data = N.row[mask], N.col[mask], N.data[mask]
+    offsets = cols - rows
+    if offsets.size and offsets.max() > bandwidth:
+        msg = (
+            f'normal matrix has entries {offsets.max()} columns off-diagonal, '
+            f'exceeding the assumed bandwidth {bandwidth}'
+        )
+        raise ValueError(msg)
+    ab = np.zeros((bandwidth + 1, n_coeffs))
+    ab[bandwidth - offsets, cols] = data
+
+    diag = ab[bandwidth, :]
+    valid = diag > 0
+    thresh = 1e-8 * np.median(diag[valid]) if valid.any() else 0.0
+    n_degenerate = int(np.count_nonzero(diag <= thresh))
+
+    def _pinv_solve():
+        N_dense = sparse.coo_matrix((N.data, (N.row, N.col)), shape=(n_coeffs, n_coeffs)).toarray()
+        return np.linalg.pinv(N_dense, rcond=1e-10) @ RHS
+
+    if n_degenerate > 0:
+        coeffs = _pinv_solve()
+    else:
+        try:
+            cb = cholesky_banded(ab, lower=False)
+            coeffs = cho_solve_banded((cb, False), RHS)
+        except LinAlgError:
+            coeffs = _pinv_solve()
+
+    return coeffs, n_degenerate
+
+
+def get_hwpss_spline(aman, signal=None, hwp_angle=None, timestamps=None,
+                      modes=[1, 2, 3, 4, 5, 6, 7, 8],
+                      degree=3, n_knots=None, samples_per_knot=4000,
+                      apply_prefilt=True, prefilt_cfg=None, prefilt_detrend='linear',
+                      flags=None,
+                      apodize_edges=True, apodize_edges_samps=1600,
+                      apodize_flags=True, apodize_flags_samps=200, apo_type='C1',
+                      merge_stats=True, hwpss_stats_name='hwpss_stats_spline',
+                      merge_model=True, hwpss_model_name='hwpss_model'):
+    r"""
+    Extracts a HWPSS template whose per-harmonic sin/cos amplitudes vary
+    slowly in time, expanded on a shared B-spline knot grid built from
+    `timestamps`:
+
+    .. math::
+        \mathrm{signal}(t) = \sum_n a_n(t)\sin{(\mathrm{modes}[n]\,\chi_\mathrm{hwp}(t))}
+            + b_n(t)\cos{(\mathrm{modes}[n]\,\chi_\mathrm{hwp}(t))}
+
+    where each :math:`a_n(t)`/:math:`b_n(t)` is itself expanded on a B-spline
+    basis. This is linear in the spline coefficients, so the fit is always a
+    weighted linear least-squares solve at full sample resolution.
+
+    We use a banded Cholesky factorization to exploit the B-spline's local support.
+    If the apodization/flags weights are identical across detectors, all detectors
+    are solved in one shot (shared design matrix, shared factorization, multi-column
+    solve). If they differ (e.g. per-detector flags), each detector is solved against
+    its own weighted normal matrix.
+
+    Parameters
+    ----------
+    aman : AxisManager object
+        The TOD to extract HWPSS from.
+    signal : str or None
+        The field name in the axis manager to use for the TOD signal.
+        If not provided, ``signal`` will be used.
+    hwp_angle : array-like, optional
+        The HWP angle for each sample in `aman`. If not provided, `aman.hwp_angle` will be used.
+    timestamps : array-like, optional
+        The sample locations used to build the B-spline knot grid. If not
+        provided, `aman.timestamps` will be used.
+    modes : list of int, optional
+        The HWPSS harmonic modes to extract. Default is [1, 2, 3, 4, 5, 6, 7, 8].
+    degree : int, optional
+        B-spline degree. Default is 3 (cubic).
+    n_knots : int, optional
+        Number of interior knot breakpoints for the B-spline grid. If None,
+        computed from `samples_per_knot`.
+    samples_per_knot : int, optional
+        Used to auto-compute `n_knots` when not given explicitly, as
+        ``max(2, n_samps // samples_per_knot)``. Default is 4000.
+    apply_prefilt : bool, optional
+        Whether to apply a high-pass filter to signal before extracting HWPSS. Default is `True`.
+        IMPORTANT: the default high-pass cutoff (1.0 Hz) will suppress slow
+        HWPSS amplitude drift if `samples_per_knot` implies a drift timescale
+        near or above 1 Hz -- lower the cutoff (via `prefilt_cfg`) or disable
+        prefiltering for typical (minutes-scale) drift.
+    prefilt_cfg : dict, optional
+        The configuration of the high-pass filter, in Hz. Only used if `apply_prefilt` is `True`.
+        Default is sine2 filter with cutoff frequency of 1.0 Hz and trans_width of 1.0 Hz.
+    prefilt_detrend : str or None
+        Method of detrending when you apply prefilter. Default is `linear`.
+    flags : str or RangesMatrix or Ranges, optional
+        Flags to be masked out before extracting HWPSS. Default is None, and no mask will be applied.
+        If provided by a string, `aman.flags.get(flags)` is used for the flags.
+    apodize_edges : bool, optional
+        If True, applies an apodization window to the edges of the signal. Defaults to True.
+    apodize_edges_samps : int, optional
+        The number of samples over which to apply the edge apodization window. Defaults to 1600.
+    apodize_flags : bool, optional
+        If True, applies an apodization window based on the flags. Defaults to True.
+    apodize_flags_samps : int, optional
+        The number of samples over which to apply the flags apodization window. Defaults to 200.
+    apo_type : str, optional
+        Type of apodization, default is C1. See tod_ops.apodize for all options.
+    merge_stats : bool, optional
+        Whether to add the extracted HWPSS statistics to `aman` as new axes. Default is `True`.
+    hwpss_stats_name : str, optional
+        The name to use for the new field containing the HWPSS statistics if `merge_stats` is `True`.
+    merge_model : bool, optional
+        Whether to add the extracted HWPSS template to `aman` as a new signal field. Default is `True`.
+    hwpss_model_name : str, optional
+        The name to use for the new signal field containing the HWPSS template if `merge_model` is
+        `True`. Defaults to 'hwpss_model' so that the generic `subtract_hwpss` can be reused unchanged.
+
+    Notes
+    -----
+    No per-detector coefficient covariance matrices are computed or stored.
+
+    Returns
+    -------
+    hwpss_stats : AxisManager object
+        The extracted HWPSS spline coefficients and statistics:
+
+            - **coeffs** (n_dets x 2*n_modes x n_bases) : per-detector, per-harmonic
+              spline coefficients.
+            - **knots** (n_bases + degree + 1,) : the clamped B-spline knot vector.
+            - **degree** : the B-spline degree used.
+            - **sigma_tod** (n_dets) : estimate of the standard deviation of the signal,
+              from `estimate_sigma_tod`.
+            - **redchi2s** (n_dets) : reduced chi^2 of the fit for each detector.
+    """
+    if prefilt_cfg is None:
+        prefilt_cfg = {'type': 'sine2', 'cutoff': 1.0, 'trans_width': 1.0}
+
+    prefilt = filters.get_hpf(prefilt_cfg)
+    if signal is None:
+        signal_name = 'signal'
+        signal = aman[signal_name]
+    elif isinstance(signal, str):
+        signal_name = signal
+        signal = aman[signal_name]
+    elif isinstance(signal, np.ndarray):
+        raise TypeError("Currently ndarray not supported, need update to tod_ops.fourier_filter module to remove signal_name argument.")
+    else:
+        raise TypeError("Signal must be None, str, or ndarray")
+
+    if apply_prefilt:
+        signal = np.array(
+            tod_ops.fourier_filter(aman, prefilt, detrend=prefilt_detrend, signal_name=signal_name)
+        )
+
+    if hwp_angle is None:
+        hwp_angle = aman.hwp_angle
+    if timestamps is None:
+        timestamps = aman.timestamps
+
+    if isinstance(flags, str):
+        flags = aman.flags.get(flags)
+
+    W = None
+    if apodize_flags and (flags is not None):
+        W = apodize.get_apodize_window_from_flags(
+            aman, flags=flags, apodize_samps=apodize_flags_samps, apo_type=apo_type
+        )
+        # W is (samps,) if the flags are identical across detectors, or
+        # (dets, samps) if they genuinely differ (see tod_ops/apodize.py).
+
+    if apodize_edges:
+        edges_apodizer = apodize.get_apodize_window_for_ends(
+            aman, apodize_samps=apodize_edges_samps, apo_type=apo_type
+        )
+        W = edges_apodizer if W is None else W * edges_apodizer
+
+    if W is None:
+        W = np.ones(aman.samps.count)
+
+    B, knots = get_bspline_design_matrix(
+        timestamps, n_knots=n_knots, samples_per_knot=samples_per_knot, degree=degree
+    )
+    n_dets = signal.shape[0]
+    n_bases = B.shape[1]
+    n_modes = len(modes)
+    n_harm = 2 * n_modes
+    n_coeffs = n_harm * n_bases
+    # Basis functions j1,j2 overlap iff |j1-j2| <= degree; combined with
+    # differing harmonic indices c1,c2 (flat index = j*n_harm+c) the largest
+    # possible index spread is degree*n_harm + (n_harm-1).
+    bandwidth = n_harm * (degree + 1) - 1
+    H = harms_func(hwp_angle, modes, coeffs=None)  # (n_harm, n_samps)
+    A = _knot_major_design_matrix(B, H)
+
+    if W.ndim == 1:
+        # Weights shared across all detectors: solve all in one shot
+        coeffs_flat, n_degenerate = _solve_spline_coeffs(A, W, signal.T, bandwidth, n_coeffs)
+        n_valid_samps = int(np.count_nonzero(W > 0))
+        dof_per_det = np.full(n_dets, max(n_valid_samps - n_coeffs, 1))
+    else:
+        # Flags differ per detector: fit each detector separately
+        coeffs_flat = np.zeros((n_coeffs, n_dets))
+        dof_per_det = np.zeros(n_dets, dtype=int)
+        n_degenerate = 0
+        for d in range(n_dets):
+            c_d, n_deg_d = _solve_spline_coeffs(A, W[d], signal[d], bandwidth, n_coeffs)
+            coeffs_flat[:, d] = c_d
+            n_degenerate += n_deg_d
+            dof_per_det[d] = max(int(np.count_nonzero(W[d] > 0)) - n_coeffs, 1)
+
+    if n_degenerate > 0:
+        logger.warning(
+            f'{n_degenerate} spline-basis x harmonic coefficients have close to '
+            'zero data support (fully flagged/apodized knot spans). Falling back '
+            'to a pseudo-inverse solve for the affected detector(s).'
+        )
+
+    # coeffs_flat is (n_coeffs, n_dets) in knot-major order (index = j*n_harm + c).
+    # Reshape to (n_dets, n_harm, n_bases), the mode-major order expected
+    # by hwpss_spline_func and the public coeffs field.
+    coeffs = coeffs_flat.T.reshape(n_dets, n_bases, n_harm).transpose(0, 2, 1)
+
+    fitsig_tod = hwpss_spline_func(timestamps, hwp_angle, modes, coeffs, knots, degree=degree)
+
+    sigma_tod = estimate_sigma_tod(signal, hwp_angle)
+    resid = signal - fitsig_tod
+    w_for_chi2 = W if W.ndim == 2 else W[None, :]
+    redchi2s = np.sum(w_for_chi2 * resid**2, axis=1) / sigma_tod**2 / dof_per_det
+
+    mode_names = []
+    for mode in modes:
+        mode_names.append(f'S{mode}')
+        mode_names.append(f'C{mode}')
+
+    hwpss_stats = core.AxisManager(
+        aman.dets,
+        core.LabelAxis(name='modes', vals=np.array(mode_names, dtype='<U3')),
+        core.IndexAxis('spline_basis', count=n_bases),
+        core.IndexAxis('knot_grid', count=len(knots)),
+    )
+    hwpss_stats.wrap('coeffs', coeffs, [(0, 'dets'), (1, 'modes'), (2, 'spline_basis')])
+    hwpss_stats.wrap('knots', knots, [(0, 'knot_grid')])
+    hwpss_stats.wrap('degree', degree)
+    hwpss_stats.wrap('sigma_tod', sigma_tod, [(0, 'dets')])
+    hwpss_stats.wrap('redchi2s', redchi2s, [(0, 'dets')])
+
+    if merge_stats:
+        aman.wrap(hwpss_stats_name, hwpss_stats)
+    if merge_model:
+        aman.wrap(hwpss_model_name, fitsig_tod, [(0, 'dets'), (1, 'samps')])
+    return hwpss_stats
+
 
 def get_hwp_freq(timestamps, hwp_angle):
     """
