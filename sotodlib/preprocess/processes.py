@@ -1095,6 +1095,7 @@ class SubtractHWPSS(_Preprocess):
         hwpss_stats: "hwpss_stats"
         process:
           subtract_name: "hwpss_remove"
+          hwpss_model_name: "hwpss_model"  # optional, defaults to "hwpss_model"
 
     .. autofunction:: sotodlib.hwp.hwp.subtract_hwpss
     """
@@ -1102,6 +1103,7 @@ class SubtractHWPSS(_Preprocess):
 
     def __init__(self, step_cfgs):
         self.hwpss_stats = step_cfgs.get('hwpss_stats', 'hwpss_stats')
+        self.hwpss_model_name = step_cfgs.get('process', {}).get('hwpss_model_name', 'hwpss_model')
         self.save_name = None
 
         super().__init__(step_cfgs)
@@ -1118,11 +1120,12 @@ class SubtractHWPSS(_Preprocess):
             else:
                 template = hwp.harms_func(aman.hwp_angle, modes,
                                           proc_aman[self.hwpss_stats].coeffs)
-            if 'hwpss_model' in aman._fields:
-                aman.move('hwpss_model', None)
-            aman.wrap('hwpss_model', template, [(0, 'dets'), (1, 'samps')])
+            if self.hwpss_model_name in aman._fields:
+                aman.move(self.hwpss_model_name, None)
+            aman.wrap(self.hwpss_model_name, template, [(0, 'dets'), (1, 'samps')])
             hwp.subtract_hwpss(
                 aman,
+                hwpss_template_name=self.hwpss_model_name,
                 subtract_name = self.process_cfgs["subtract_name"]
                 )
 
@@ -1175,6 +1178,7 @@ class SubtractHWPSSSpline(_Preprocess):
         hwpss_stats: "hwpss_stats_spline"
         process:
           subtract_name: "hwpss_remove"
+          hwpss_model_name: "hwpss_model"  # optional, defaults to "hwpss_model"
 
     .. autofunction:: sotodlib.hwp.hwp.hwpss_spline_func
     .. autofunction:: sotodlib.hwp.hwp.subtract_hwpss
@@ -1183,6 +1187,7 @@ class SubtractHWPSSSpline(_Preprocess):
 
     def __init__(self, step_cfgs):
         self.hwpss_stats = step_cfgs.get('hwpss_stats', 'hwpss_stats_spline')
+        self.hwpss_model_name = step_cfgs.get('process', {}).get('hwpss_model_name', 'hwpss_model')
         self.save_name = None
 
         super().__init__(step_cfgs)
@@ -1202,10 +1207,11 @@ class SubtractHWPSSSpline(_Preprocess):
             else:
                 template = hwp.hwpss_spline_func(aman.timestamps, aman.hwp_angle, modes,
                                                   stats.coeffs, stats.knots, degree=degree)
-            if 'hwpss_model' in aman._fields:
-                aman.move('hwpss_model', None)
-            aman.wrap('hwpss_model', template, [(0, 'dets'), (1, 'samps')])
-            hwp.subtract_hwpss(aman, subtract_name=self.process_cfgs["subtract_name"])
+            if self.hwpss_model_name in aman._fields:
+                aman.move(self.hwpss_model_name, None)
+            aman.wrap(self.hwpss_model_name, template, [(0, 'dets'), (1, 'samps')])
+            hwp.subtract_hwpss(aman, hwpss_template_name=self.hwpss_model_name,
+                                subtract_name=self.process_cfgs["subtract_name"])
 
         return aman, proc_aman
 
@@ -1231,13 +1237,6 @@ class EstimateHWPSSGainSpline(_Preprocess):
           hwpss_stats_name: "hwpss_gain_stats_spline"
           merge_model: False
         save: True
-
-    Note: ``get_hwpss_gain_spline`` defaults to ``merge_model: True`` (wraps
-    its template into ``aman['hwpss_model']``), same as ``estimate_hwpss``.
-    If this step runs as a calc-only diagnostic (no matching subtract step
-    consuming/removing that field), and the template's own ``estimate_hwpss``
-    step also left an unconsumed ``hwpss_model`` field, the two collide.
-    Pass ``merge_model: False`` in ``calc`` for diagnostic-only use.
 
     .. autofunction:: sotodlib.hwp.hwp.get_hwpss_gain_spline
     """
@@ -1275,6 +1274,7 @@ class SubtractHWPSSGainSpline(_Preprocess):
         hwpss_stats: "hwpss_gain_stats_spline"
         process:
           subtract_name: "hwpss_remove"
+          hwpss_model_name: "hwpss_model"  # optional, defaults to "hwpss_model"
 
     .. autofunction:: sotodlib.hwp.hwp.hwpss_gain_spline_func
     .. autofunction:: sotodlib.hwp.hwp.subtract_hwpss
@@ -1283,6 +1283,7 @@ class SubtractHWPSSGainSpline(_Preprocess):
 
     def __init__(self, step_cfgs):
         self.hwpss_stats = step_cfgs.get('hwpss_stats', 'hwpss_gain_stats_spline')
+        self.hwpss_model_name = step_cfgs.get('process', {}).get('hwpss_model_name', 'hwpss_model')
         self.save_name = None
 
         super().__init__(step_cfgs)
@@ -1305,10 +1306,11 @@ class SubtractHWPSSGainSpline(_Preprocess):
                 template = hwp.hwpss_gain_spline_func(
                     aman.timestamps, aman.hwp_angle, modes, stats.template_coeffs,
                     stats.coeffs, stats.knots, degree=degree)
-            if 'hwpss_model' in aman._fields:
-                aman.move('hwpss_model', None)
-            aman.wrap('hwpss_model', template, [(0, 'dets'), (1, 'samps')])
-            hwp.subtract_hwpss(aman, subtract_name=self.process_cfgs["subtract_name"])
+            if self.hwpss_model_name in aman._fields:
+                aman.move(self.hwpss_model_name, None)
+            aman.wrap(self.hwpss_model_name, template, [(0, 'dets'), (1, 'samps')])
+            hwp.subtract_hwpss(aman, hwpss_template_name=self.hwpss_model_name,
+                                subtract_name=self.process_cfgs["subtract_name"])
 
         return aman, proc_aman
 
