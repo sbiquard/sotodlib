@@ -182,5 +182,84 @@ class HwpssSplineTest(unittest.TestCase):
         self.assertTrue(np.all(err_per_det < 1e-5))
 
 
+class HwpssGainSplineTest(unittest.TestCase):
+    "Test the shared gain-drift B-spline HWPSS fitting functions"
+
+    def test_gain_spline_exact_recovery(self):
+        """Noiseless signal built from a fixed template x a known gain
+        spline: template/gain coefficients should recover to near machine
+        precision, using far fewer parameters than the per-harmonic
+        spline (one spline channel total, not one per harmonic)."""
+        rng = np.random.default_rng(0)
+        ts = np.arange(0, 600, 1/200)
+        hwp_angle = (2*np.pi*2*ts) % (2*np.pi)
+        modes = [1, 2, 3, 4, 5, 6, 7, 8]
+        degree = 3
+        n_knots = 10
+        ndets = 3
+
+        template_coeffs = 12.5 * (rng.random((ndets, 2*len(modes))) - 0.5)
+        _, knots = hwp.get_bspline_design_matrix(ts, n_knots=n_knots, degree=degree)
+        n_bases = len(knots) - degree - 1
+        true_gain_coeffs = 1.0 + 0.3 * (rng.random((ndets, n_bases)) - 0.5)
+        signal = hwp.hwpss_gain_spline_func(ts, hwp_angle, modes, template_coeffs,
+                                            true_gain_coeffs, knots, degree=degree)
+
+        dets = ['det%i' % i for i in range(ndets)]
+        tod = core.AxisManager(core.LabelAxis('dets', vals=dets),
+                               core.OffsetAxis('samps', count=len(ts)))
+        tod.wrap('timestamps', ts, axis_map=[(0, 'samps')])
+        tod.wrap('hwp_angle', hwp_angle, axis_map=[(0, 'samps')])
+        tod.wrap('signal', signal, axis_map=[(0, 'dets'), (1, 'samps')])
+
+        hwp.get_hwpss_gain_spline(tod, template_coeffs=template_coeffs, modes=modes,
+                                  degree=degree, n_knots=n_knots, apply_prefilt=False)
+        np.testing.assert_allclose(tod.hwpss_model, signal, atol=1e-6)
+        np.testing.assert_allclose(tod.hwpss_gain_stats_spline.coeffs, true_gain_coeffs, atol=1e-6)
+
+    def test_gain_spline_per_det_flags(self):
+        """Detectors flagged at different times: each should recover its own
+        gain coefficients, unaffected by other detectors' flags."""
+        from so3g.proj import Ranges, RangesMatrix
+        rng = np.random.default_rng(0)
+        ts = np.arange(0, 600, 1/200)
+        hwp_angle = (2*np.pi*2*ts) % (2*np.pi)
+        modes = [1, 2, 3, 4, 5, 6, 7, 8]
+        degree = 3
+        n_knots = 10
+        ndets = 4
+
+        template_coeffs = 12.5 * (rng.random((ndets, 2*len(modes))) - 0.5)
+        _, knots = hwp.get_bspline_design_matrix(ts, n_knots=n_knots, degree=degree)
+        n_bases = len(knots) - degree - 1
+        true_gain_coeffs = 1.0 + 0.3 * (rng.random((ndets, n_bases)) - 0.5)
+        signal = hwp.hwpss_gain_spline_func(ts, hwp_angle, modes, template_coeffs,
+                                            true_gain_coeffs, knots, degree=degree)
+
+        dets = ['det%i' % i for i in range(ndets)]
+        tod = core.AxisManager(core.LabelAxis('dets', vals=dets),
+                               core.OffsetAxis('samps', count=len(ts)))
+        tod.wrap('timestamps', ts, axis_map=[(0, 'samps')])
+        tod.wrap('hwp_angle', hwp_angle, axis_map=[(0, 'samps')])
+        tod.wrap('signal', signal, axis_map=[(0, 'dets'), (1, 'samps')])
+
+        ranges = []
+        for d in range(ndets):
+            start = 20000 + d * 30000
+            ranges.append(Ranges.from_array(
+                np.array([[start, start + 10000]], dtype='int32'), tod.samps.count))
+        flags = core.FlagManager.for_tod(tod)
+        flags.wrap('glitches', RangesMatrix(ranges))
+        tod.wrap('flags', flags)
+
+        hwp.get_hwpss_gain_spline(tod, template_coeffs=template_coeffs, modes=modes,
+                                  degree=degree, n_knots=n_knots, flags='glitches',
+                                  apodize_flags=True, apodize_flags_samps=100,
+                                  apply_prefilt=False)
+        self.assertTrue(np.all(np.isfinite(tod.hwpss_model)))
+        err_per_det = np.max(np.abs(tod.hwpss_gain_stats_spline.coeffs - true_gain_coeffs), axis=1)
+        self.assertTrue(np.all(err_per_det < 1e-5))
+
+
 if __name__ == '__main__':
     unittest.main()

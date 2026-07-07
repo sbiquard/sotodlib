@@ -1210,6 +1210,109 @@ class SubtractHWPSSSpline(_Preprocess):
         return aman, proc_aman
 
 
+class EstimateHWPSSGainSpline(_Preprocess):
+    """
+    Builds a single shared time-varying gain g(t) (B-spline) multiplying a
+    fixed constant-coefficient HWPSS template taken from an existing
+    ``estimate_hwpss`` step's saved stats. Calc configs go to
+    ``hwp.get_hwpss_gain_spline``.
+
+    Appropriate when HWPSS drift is a broadband gain-like effect (hits every
+    harmonic equally) rather than harmonic-specific -- cheaper than
+    ``estimate_hwpss_spline`` since it fits one spline channel per detector
+    instead of one per harmonic.
+
+    Example config block::
+
+      - name: "estimate_hwpss_gain_spline"
+        template_hwpss_stats: "post_hwpss_stats"
+        calc:
+          samples_per_knot: 4000
+          hwpss_stats_name: "hwpss_gain_stats_spline"
+          merge_model: False
+        save: True
+
+    Note: ``get_hwpss_gain_spline`` defaults to ``merge_model: True`` (wraps
+    its template into ``aman['hwpss_model']``), same as ``estimate_hwpss``.
+    If this step runs as a calc-only diagnostic (no matching subtract step
+    consuming/removing that field), and the template's own ``estimate_hwpss``
+    step also left an unconsumed ``hwpss_model`` field, the two collide.
+    Pass ``merge_model: False`` in ``calc`` for diagnostic-only use.
+
+    .. autofunction:: sotodlib.hwp.hwp.get_hwpss_gain_spline
+    """
+    name = "estimate_hwpss_gain_spline"
+
+    def __init__(self, step_cfgs):
+        self.template_hwpss_stats = step_cfgs.get('template_hwpss_stats', 'hwpss_stats')
+        self.save_name = step_cfgs.get('calc', {}).get("hwpss_stats_name", "hwpss_gain_stats_spline")
+
+        super().__init__(step_cfgs)
+
+    def calc_and_save(self, aman, proc_aman):
+        template_stats = proc_aman[self.template_hwpss_stats]
+        modes = [int(m[1:]) for m in template_stats.modes.vals[::2]]
+        hwpss_stats = hwp.get_hwpss_gain_spline(
+            aman, template_coeffs=template_stats.coeffs, modes=modes, **self.calc_cfgs)
+        self.save(proc_aman, hwpss_stats)
+
+        return aman, proc_aman
+
+    def save(self, proc_aman, hwpss_stats):
+        if self.save_cfgs:
+            proc_aman.wrap(self.save_name, hwpss_stats)
+        else:
+            return
+
+
+class SubtractHWPSSGainSpline(_Preprocess):
+    """Subtracts a shared gain-drift HWPSS template (a single time-varying
+    gain g(t) multiplying a fixed constant-coefficient template) from signal.
+
+    Example config block::
+
+      - name: "subtract_hwpss_gain_spline"
+        hwpss_stats: "hwpss_gain_stats_spline"
+        process:
+          subtract_name: "hwpss_remove"
+
+    .. autofunction:: sotodlib.hwp.hwp.hwpss_gain_spline_func
+    .. autofunction:: sotodlib.hwp.hwp.subtract_hwpss
+    """
+    name = "subtract_hwpss_gain_spline"
+
+    def __init__(self, step_cfgs):
+        self.hwpss_stats = step_cfgs.get('hwpss_stats', 'hwpss_gain_stats_spline')
+        self.save_name = None
+
+        super().__init__(step_cfgs)
+
+    def process(self, aman, proc_aman, sim=False, data_aman=None):
+        if data_aman is not None:
+            raise NotImplementedError("No support for using data AxisManager in process")
+        if proc_aman[self.hwpss_stats] is not None:
+            stats = proc_aman[self.hwpss_stats]
+            modes = [int(m[1:]) for m in stats.template_modes.vals[::2]]
+            degree = int(stats.degree)
+            if sim:
+                hwpss_stats = hwp.get_hwpss_gain_spline(
+                    aman, template_coeffs=stats.template_coeffs, modes=modes,
+                    degree=degree, merge_stats=False, merge_model=False)
+                template = hwp.hwpss_gain_spline_func(
+                    aman.timestamps, aman.hwp_angle, modes, stats.template_coeffs,
+                    hwpss_stats.coeffs, hwpss_stats.knots, degree=degree)
+            else:
+                template = hwp.hwpss_gain_spline_func(
+                    aman.timestamps, aman.hwp_angle, modes, stats.template_coeffs,
+                    stats.coeffs, stats.knots, degree=degree)
+            if 'hwpss_model' in aman._fields:
+                aman.move('hwpss_model', None)
+            aman.wrap('hwpss_model', template, [(0, 'dets'), (1, 'samps')])
+            hwp.subtract_hwpss(aman, subtract_name=self.process_cfgs["subtract_name"])
+
+        return aman, proc_aman
+
+
 class A2Stats(_Preprocess):
     """
     Calculate statistical metrics for A2, the 2f-demodulated Q and U signals.
@@ -3374,6 +3477,8 @@ _Preprocess.register(EstimateHWPSS)
 _Preprocess.register(SubtractHWPSS)
 _Preprocess.register(EstimateHWPSSSpline)
 _Preprocess.register(SubtractHWPSSSpline)
+_Preprocess.register(EstimateHWPSSGainSpline)
+_Preprocess.register(SubtractHWPSSGainSpline)
 _Preprocess.register(A2Stats)
 _Preprocess.register(Apodize)
 _Preprocess.register(Demodulate)
