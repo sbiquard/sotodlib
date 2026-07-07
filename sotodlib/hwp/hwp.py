@@ -670,12 +670,12 @@ def _knot_major_design_matrix(B, H):
     """
     n_harm = H.shape[0]
     n_bases = B.shape[1]
-    blocks = [B.multiply(H[c][:, None]) for c in range(n_harm)]
-    A_mode_major = sparse.hstack(blocks, format='csr')
-    perm = np.array([j * n_harm + c for c in range(n_harm) for j in range(n_bases)])
-    inv_perm = np.empty_like(perm)
-    inv_perm[perm] = np.arange(n_harm * n_bases)
-    return A_mode_major[:, inv_perm].tocsr()
+    Bc = B.tocoo()
+    t_idx, j_idx, v = Bc.row, Bc.col, Bc.data
+    data = (v[None, :] * H[:, t_idx]).T.ravel()  # (nnz, n_harm), harmonic fastest
+    rows = np.repeat(t_idx, n_harm)
+    cols = np.repeat(j_idx, n_harm) * n_harm + np.tile(np.arange(n_harm), len(t_idx))
+    return sparse.csr_array((data, (rows, cols)), shape=(B.shape[0], n_harm * n_bases))
 
 
 def _solve_spline_coeffs(A, w, y, bandwidth, n_coeffs):
