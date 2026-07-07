@@ -104,5 +104,83 @@ class HwpssTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _ = hwp.get_hwpss(tod, lin_reg=lr, bin_signal=bn, modes=[2, 4])
 
+
+def make_fake_tod_spline(ts=np.arange(0, 600, 1/200), modes=(2, 4), ndets=3,
+                         degree=3, n_knots=6, coeff_scale=12.5, seed=0):
+    """Build a synthetic AxisManager whose signal is exactly expressible in
+    the B-spline x harmonic basis that `get_hwpss_spline` fits, by generating
+    the signal via `hwp.hwpss_spline_func` itself.
+    """
+    rng = np.random.default_rng(seed)
+    hwp_angle = (2*np.pi*2*ts) % (2*np.pi)
+    _, knots = hwp.get_bspline_design_matrix(ts, n_knots=n_knots, degree=degree)
+    n_bases = len(knots) - degree - 1
+    true_coeffs = coeff_scale * (rng.random((ndets, 2*len(modes), n_bases)) - 0.5)
+    signal = hwp.hwpss_spline_func(ts, hwp_angle, list(modes), true_coeffs, knots, degree=degree)
+
+    dets = ['det%i' % i for i in range(ndets)]
+    tod = core.AxisManager(core.LabelAxis('dets', vals=dets),
+                           core.OffsetAxis('samps', count=len(ts)))
+    tod.wrap('timestamps', ts, axis_map=[(0, 'samps')])
+    tod.wrap('hwp_angle', hwp_angle, axis_map=[(0, 'samps')])
+    tod.wrap('signal', signal, axis_map=[(0, 'dets'), (1, 'samps')])
+    return tod, true_coeffs, knots
+
+
+class HwpssSplineTest(unittest.TestCase):
+    "Test the B-spline x HWP-harmonic HWPSS fitting functions"
+
+    def test_spline_exact_recovery(self):
+        """Noiseless signal built from the exact fitted basis: template and
+        coefficients should recover to near machine precision."""
+        tod, true_coeffs, _ = make_fake_tod_spline()
+        modes = [2, 4]
+        signal = tod.signal.copy()
+        hwp.get_hwpss_spline(tod, modes=modes, degree=3, n_knots=6, apply_prefilt=False)
+        np.testing.assert_allclose(tod.hwpss_model, signal, atol=1e-6)
+        np.testing.assert_allclose(tod.hwpss_stats_spline.coeffs, true_coeffs, atol=1e-6)
+
+    def test_spline_with_flags(self):
+        """A fully-flagged span wiping out a knot should log a warning and
+        fall back to a finite (pinv) solution, not NaN/inf."""
+        from so3g.proj import Ranges
+        tod, _, _ = make_fake_tod_spline(n_knots=100)
+        r = Ranges.from_array(np.array([[20000, 100000]], dtype='int32'), tod.samps.count)
+        flags = core.FlagManager.for_tod(tod)
+        flags.wrap('cal_stop', r)
+        tod.wrap('flags', flags)
+
+        with self.assertLogs('sotodlib.hwp.hwp', level='WARNING'):
+            hwp.get_hwpss_spline(tod, modes=[2, 4], degree=3, n_knots=100,
+                                 flags='cal_stop', apodize_flags=True,
+                                 apodize_flags_samps=50, apply_prefilt=False)
+        self.assertTrue(np.all(np.isfinite(tod.hwpss_model)))
+
+    def test_spline_per_det_flags(self):
+        """Detectors flagged at different times: each should recover its own
+        coefficients, unaffected by other detectors' flags."""
+        from so3g.proj import Ranges, RangesMatrix
+        modes = [2, 4]
+        degree = 3
+        n_knots = 10
+        tod, true_coeffs, _ = make_fake_tod_spline(modes=modes, ndets=4, degree=degree, n_knots=n_knots)
+        ndets = tod.dets.count
+        ranges = []
+        for d in range(ndets):
+            start = 20000 + d * 30000
+            ranges.append(Ranges.from_array(
+                np.array([[start, start + 10000]], dtype='int32'), tod.samps.count))
+        flags = core.FlagManager.for_tod(tod)
+        flags.wrap('glitches', RangesMatrix(ranges))
+        tod.wrap('flags', flags)
+
+        hwp.get_hwpss_spline(tod, modes=modes, degree=degree, n_knots=n_knots,
+                             flags='glitches', apodize_flags=True,
+                             apodize_flags_samps=100, apply_prefilt=False)
+        self.assertTrue(np.all(np.isfinite(tod.hwpss_model)))
+        err_per_det = np.max(np.abs(tod.hwpss_stats_spline.coeffs - true_coeffs), axis=(1, 2))
+        self.assertTrue(np.all(err_per_det < 1e-5))
+
+
 if __name__ == '__main__':
     unittest.main()
