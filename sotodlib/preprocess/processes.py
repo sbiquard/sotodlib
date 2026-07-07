@@ -1128,6 +1128,88 @@ class SubtractHWPSS(_Preprocess):
 
         return aman, proc_aman
 
+
+class EstimateHWPSSSpline(_Preprocess):
+    """
+    Builds a B-spline x HWP-harmonic HWPSS template with time-varying
+    per-harmonic amplitudes. Calc configs go to ``hwp.get_hwpss_spline``.
+
+    Example config block::
+
+      - name: "estimate_hwpss_spline"
+        calc:
+          modes: [2, 4]
+          degree: 3
+          samples_per_knot: 4000
+          hwpss_stats_name: "hwpss_stats_spline"
+        save: True
+
+    .. autofunction:: sotodlib.hwp.hwp.get_hwpss_spline
+    """
+    name = "estimate_hwpss_spline"
+
+    def __init__(self, step_cfgs):
+        self.save_name = step_cfgs.get('calc', {}).get("hwpss_stats_name", "hwpss_stats_spline")
+
+        super().__init__(step_cfgs)
+
+    def calc_and_save(self, aman, proc_aman):
+        hwpss_stats = hwp.get_hwpss_spline(aman, **self.calc_cfgs)
+        self.save(proc_aman, hwpss_stats)
+
+        return aman, proc_aman
+
+    def save(self, proc_aman, hwpss_stats):
+        if self.save_cfgs:
+            proc_aman.wrap(self.save_name, hwpss_stats)
+        else:
+            return
+
+
+class SubtractHWPSSSpline(_Preprocess):
+    """Subtracts a B-spline x HWP-harmonic HWPSS template from signal.
+
+    Example config block::
+
+      - name: "subtract_hwpss_spline"
+        hwpss_stats: "hwpss_stats_spline"
+        process:
+          subtract_name: "hwpss_remove"
+
+    .. autofunction:: sotodlib.hwp.hwp.hwpss_spline_func
+    .. autofunction:: sotodlib.hwp.hwp.subtract_hwpss
+    """
+    name = "subtract_hwpss_spline"
+
+    def __init__(self, step_cfgs):
+        self.hwpss_stats = step_cfgs.get('hwpss_stats', 'hwpss_stats_spline')
+        self.save_name = None
+
+        super().__init__(step_cfgs)
+
+    def process(self, aman, proc_aman, sim=False, data_aman=None):
+        if data_aman is not None:
+            raise NotImplementedError("No support for using data AxisManager in process")
+        if proc_aman[self.hwpss_stats] is not None:
+            stats = proc_aman[self.hwpss_stats]
+            modes = [int(m[1:]) for m in stats.modes.vals[::2]]
+            degree = int(stats.degree)
+            if sim:
+                hwpss_stats = hwp.get_hwpss_spline(aman, merge_stats=False, merge_model=False,
+                                                    modes=modes, degree=degree)
+                template = hwp.hwpss_spline_func(aman.timestamps, aman.hwp_angle, modes,
+                                                  hwpss_stats.coeffs, hwpss_stats.knots, degree=degree)
+            else:
+                template = hwp.hwpss_spline_func(aman.timestamps, aman.hwp_angle, modes,
+                                                  stats.coeffs, stats.knots, degree=degree)
+            if 'hwpss_model' in aman._fields:
+                aman.move('hwpss_model', None)
+            aman.wrap('hwpss_model', template, [(0, 'dets'), (1, 'samps')])
+            hwp.subtract_hwpss(aman, subtract_name=self.process_cfgs["subtract_name"])
+
+        return aman, proc_aman
+
+
 class A2Stats(_Preprocess):
     """
     Calculate statistical metrics for A2, the 2f-demodulated Q and U signals.
@@ -3290,6 +3372,8 @@ _Preprocess.register(Noise)
 _Preprocess.register(Calibrate)
 _Preprocess.register(EstimateHWPSS)
 _Preprocess.register(SubtractHWPSS)
+_Preprocess.register(EstimateHWPSSSpline)
+_Preprocess.register(SubtractHWPSSSpline)
 _Preprocess.register(A2Stats)
 _Preprocess.register(Apodize)
 _Preprocess.register(Demodulate)
