@@ -773,8 +773,8 @@ def _get_hwpss_weights(aman, flags, apodize_edges, apodize_edges_samps,
 
 
 def get_hwpss_spline(aman, signal=None, hwp_angle=None, timestamps=None,
-                      modes=[1, 2, 3, 4, 5, 6, 7, 8],
-                      degree=3, n_knots=None, samples_per_knot=4000,
+                      modes=[2, 4],
+                      degree=3, n_knots=None, samples_per_knot=10000,
                       apply_prefilt=True, prefilt_cfg=None, prefilt_detrend='linear',
                       flags=None,
                       apodize_edges=True, apodize_edges_samps=1600,
@@ -813,7 +813,7 @@ def get_hwpss_spline(aman, signal=None, hwp_angle=None, timestamps=None,
         The sample locations used to build the B-spline knot grid. If not
         provided, `aman.timestamps` will be used.
     modes : list of int, optional
-        The HWPSS harmonic modes to extract. Default is [1, 2, 3, 4, 5, 6, 7, 8].
+        The HWPSS harmonic modes to extract. Default is [2, 4].
     degree : int, optional
         B-spline degree. Default is 3 (cubic).
     n_knots : int, optional
@@ -821,7 +821,7 @@ def get_hwpss_spline(aman, signal=None, hwp_angle=None, timestamps=None,
         computed from `samples_per_knot`.
     samples_per_knot : int, optional
         Used to auto-compute `n_knots` when not given explicitly, as
-        ``max(2, n_samps // samples_per_knot)``. Default is 4000.
+        ``max(2, n_samps // samples_per_knot)``. Default is 10000.
     apply_prefilt : bool, optional
         Whether to apply a high-pass filter to signal before extracting HWPSS. Default is `True`.
         IMPORTANT: the default high-pass cutoff (1.0 Hz) will suppress slow

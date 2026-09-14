@@ -1237,7 +1237,7 @@ class EstimateHWPSSSpline(_Preprocess):
         calc:
           modes: [2, 4]
           degree: 3
-          samples_per_knot: 4000
+          samples_per_knot: 10000
           hwpss_stats_name: "hwpss_stats_spline"
         save: True
 
