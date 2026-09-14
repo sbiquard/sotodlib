@@ -739,6 +739,39 @@ def _solve_spline_coeffs(A, w, y, bandwidth, n_coeffs):
     return coeffs, n_degenerate
 
 
+def _get_hwpss_weights(aman, flags, apodize_edges, apodize_edges_samps,
+                        apodize_flags, apodize_flags_samps, apo_type):
+    """
+    Build the per-sample fit weight from edge/flag apodization, shared by
+    `get_hwpss_spline` and the other spline HWPSS fits.
+
+    Returns
+    -------
+    W : ndarray, shape (n_samps,) or (n_dets, n_samps)
+        (dets, samps) if `flags` genuinely differ across detectors, else
+        (samps,) shared -- see `tod_ops.apodize.get_apodize_window_from_flags`.
+    """
+    if isinstance(flags, str):
+        flags = aman.flags.get(flags)
+
+    W = None
+    if apodize_flags and (flags is not None):
+        W = apodize.get_apodize_window_from_flags(
+            aman, flags=flags, apodize_samps=apodize_flags_samps, apo_type=apo_type
+        )
+
+    if apodize_edges:
+        edges_apodizer = apodize.get_apodize_window_for_ends(
+            aman, apodize_samps=apodize_edges_samps, apo_type=apo_type
+        )
+        W = edges_apodizer if W is None else W * edges_apodizer
+
+    if W is None:
+        W = np.ones(aman.samps.count)
+
+    return W
+
+
 def get_hwpss_spline(aman, signal=None, hwp_angle=None, timestamps=None,
                       modes=[1, 2, 3, 4, 5, 6, 7, 8],
                       degree=3, n_knots=None, samples_per_knot=4000,
@@ -865,25 +898,8 @@ def get_hwpss_spline(aman, signal=None, hwp_angle=None, timestamps=None,
     if timestamps is None:
         timestamps = aman.timestamps
 
-    if isinstance(flags, str):
-        flags = aman.flags.get(flags)
-
-    W = None
-    if apodize_flags and (flags is not None):
-        W = apodize.get_apodize_window_from_flags(
-            aman, flags=flags, apodize_samps=apodize_flags_samps, apo_type=apo_type
-        )
-        # W is (samps,) if the flags are identical across detectors, or
-        # (dets, samps) if they genuinely differ (see tod_ops/apodize.py).
-
-    if apodize_edges:
-        edges_apodizer = apodize.get_apodize_window_for_ends(
-            aman, apodize_samps=apodize_edges_samps, apo_type=apo_type
-        )
-        W = edges_apodizer if W is None else W * edges_apodizer
-
-    if W is None:
-        W = np.ones(aman.samps.count)
+    W = _get_hwpss_weights(aman, flags, apodize_edges, apodize_edges_samps,
+                            apodize_flags, apodize_flags_samps, apo_type)
 
     B, knots = get_bspline_design_matrix(
         timestamps, n_knots=n_knots, samples_per_knot=samples_per_knot, degree=degree
