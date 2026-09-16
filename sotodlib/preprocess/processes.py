@@ -1226,32 +1226,55 @@ class SubtractHWPSS(_Preprocess):
         return aman, proc_aman
 
 
-class EstimateHWPSSSpline(_Preprocess):
+class HWPSSSpline(_Preprocess):
     """
-    Builds a B-spline x HWP-harmonic HWPSS template with time-varying
-    per-harmonic amplitudes. Calc configs go to ``hwp.get_hwpss_spline``.
+    Fit and subtract a B-spline x HWP-harmonic HWPSS template, whose
+    per-harmonic sin/cos amplitudes vary slowly in time. Calc configs go to
+    ``hwp.get_hwpss_spline``.
+
+    Unlike ``estimate_hwpss``/``subtract_hwpss``, the fit and the subtraction
+    live in one step so that the subtraction can see the fit configuration.
+    That matters on simulations: the archived coefficients describe the data,
+    so the fit is redone on the sim to apply the same linear filter, and
+    reproducing that filter needs the same flags (which set the fit weights)
+    and the same knot grid. The grid is taken from the archived stats rather
+    than rebuilt, so it matches exactly.
 
     Example config block::
 
-      - name: "estimate_hwpss_spline"
+      - name: "hwpss_spline"
+        skip_on_sim: False
         calc:
           modes: [2, 4]
           degree: 3
           samples_per_knot: 10000
           hwpss_stats_name: "hwpss_stats_spline"
+          flags: "flags.glitch_flags"
+          merge_model: False
         save: True
+        process:
+          subtract: True
+          subtract_name: "signal"
+          hwpss_model_name: "hwpss_model_spline"
 
     .. autofunction:: sotodlib.hwp.hwp.get_hwpss_spline
+    .. autofunction:: sotodlib.hwp.hwp.hwpss_spline_func
+    .. autofunction:: sotodlib.hwp.hwp.subtract_hwpss
     """
-    name = "estimate_hwpss_spline"
+    name = "hwpss_spline"
 
     def __init__(self, step_cfgs):
         self.save_name = step_cfgs.get('calc', {}).get("hwpss_stats_name", "hwpss_stats_spline")
+        self.hwpss_model_name = step_cfgs.get('process', {}).get('hwpss_model_name', 'hwpss_model')
 
         super().__init__(step_cfgs)
 
     def calc_and_save(self, aman, proc_aman):
-        hwpss_stats = hwp.get_hwpss_spline(aman, **self.calc_cfgs)
+        if self.process_cfgs and self.process_cfgs.get("subtract"):
+            # process() already did the fit so it could subtract; just archive
+            hwpss_stats = aman[self.save_name]
+        else:
+            hwpss_stats = hwp.get_hwpss_spline(aman, **self.calc_cfgs)
         self.save(proc_aman, hwpss_stats)
 
         return aman, proc_aman
@@ -1262,50 +1285,52 @@ class EstimateHWPSSSpline(_Preprocess):
         else:
             return
 
-
-class SubtractHWPSSSpline(_Preprocess):
-    """Subtracts a B-spline x HWP-harmonic HWPSS template from signal.
-
-    Example config block::
-
-      - name: "subtract_hwpss_spline"
-        hwpss_stats: "hwpss_stats_spline"
-        process:
-          subtract_name: "hwpss_remove"
-          hwpss_model_name: "hwpss_model"  # optional, defaults to "hwpss_model"
-
-    .. autofunction:: sotodlib.hwp.hwp.hwpss_spline_func
-    .. autofunction:: sotodlib.hwp.hwp.subtract_hwpss
-    """
-    name = "subtract_hwpss_spline"
-
-    def __init__(self, step_cfgs):
-        self.hwpss_stats = step_cfgs.get('hwpss_stats', 'hwpss_stats_spline')
-        self.hwpss_model_name = step_cfgs.get('process', {}).get('hwpss_model_name', 'hwpss_model')
-        self.save_name = None
-
-        super().__init__(step_cfgs)
+    def _fit_kwargs(self, **overrides):
+        cfgs = dict(self.calc_cfgs)
+        cfgs.update(overrides)
+        return cfgs
 
     def process(self, aman, proc_aman, sim=False, data_aman=None):
         if data_aman is not None:
             raise NotImplementedError("No support for using data AxisManager in process")
-        if proc_aman[self.hwpss_stats] is not None:
-            stats = proc_aman[self.hwpss_stats]
-            modes = [int(m[1:]) for m in stats.spline_modes.vals[::2]]
+        if self.process_cfgs is None:
+            return aman, proc_aman
+        if not self.process_cfgs.get("subtract"):
+            hwp.get_hwpss_spline(aman, **self.calc_cfgs)
+            return aman, proc_aman
+
+        if self.save_name in proc_aman:
+            stats = proc_aman[self.save_name]
             degree = int(stats.degree)
+            modes = [int(m[1:]) for m in stats.spline_modes.vals[::2]]
             if sim:
-                hwpss_stats = hwp.get_hwpss_spline(aman, merge_stats=False, merge_model=False,
-                                                    modes=modes, degree=degree)
-                template = hwp.hwpss_spline_func(aman.timestamps, aman.hwp_angle, modes,
-                                                  hwpss_stats.coeffs, hwpss_stats.knots, degree=degree)
+                # The archived coefficients describe the data, so refit on the
+                # sim to apply the same filter. The knot grid comes from the
+                # stats so it matches exactly, and the flags come from
+                # calc_cfgs so the fit weights match too.
+                cfgs = self._fit_kwargs(merge_stats=False, merge_model=False,
+                                        knots=stats.knots)
+                for key in ('hwpss_stats_name', 'n_knots', 'samples_per_knot'):
+                    cfgs.pop(key, None)
+                fit = hwp.get_hwpss_spline(aman, **cfgs)
+                coeffs, knots = fit.coeffs, fit.knots
             else:
-                template = hwp.hwpss_spline_func(aman.timestamps, aman.hwp_angle, modes,
-                                                  stats.coeffs, stats.knots, degree=degree)
-            if self.hwpss_model_name in aman._fields:
-                aman.move(self.hwpss_model_name, None)
-            aman.wrap(self.hwpss_model_name, template, [(0, 'dets'), (1, 'samps')])
-            hwp.subtract_hwpss(aman, hwpss_template_name=self.hwpss_model_name,
-                                subtract_name=self.process_cfgs["subtract_name"])
+                coeffs, knots = stats.coeffs, stats.knots
+        else:
+            # Calc pass: no archived stats yet, so fit here and let
+            # calc_and_save archive what we leave on aman.
+            fit = hwp.get_hwpss_spline(aman, **self._fit_kwargs(merge_model=False))
+            degree = int(fit.degree)
+            modes = [int(m[1:]) for m in fit.spline_modes.vals[::2]]
+            coeffs, knots = fit.coeffs, fit.knots
+
+        template = hwp.hwpss_spline_func(aman.timestamps, aman.hwp_angle, modes,
+                                          coeffs, knots, degree=degree)
+        if self.hwpss_model_name in aman._fields:
+            aman.move(self.hwpss_model_name, None)
+        aman.wrap(self.hwpss_model_name, template, [(0, 'dets'), (1, 'samps')])
+        hwp.subtract_hwpss(aman, hwpss_template_name=self.hwpss_model_name,
+                            subtract_name=self.process_cfgs["subtract_name"])
 
         return aman, proc_aman
 
@@ -3767,8 +3792,7 @@ _Preprocess.register(Noise)
 _Preprocess.register(Calibrate)
 _Preprocess.register(EstimateHWPSS)
 _Preprocess.register(SubtractHWPSS)
-_Preprocess.register(EstimateHWPSSSpline)
-_Preprocess.register(SubtractHWPSSSpline)
+_Preprocess.register(HWPSSSpline)
 _Preprocess.register(A2Stats)
 _Preprocess.register(Apodize)
 _Preprocess.register(Demodulate)

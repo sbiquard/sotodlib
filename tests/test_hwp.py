@@ -181,6 +181,25 @@ class HwpssSplineTest(unittest.TestCase):
         err_per_det = np.max(np.abs(tod.hwpss_stats_spline.coeffs - true_coeffs), axis=(1, 2))
         self.assertTrue(np.all(err_per_det < 1e-5))
 
+    def test_spline_explicit_knots_reproduce_fit(self):
+        """Passing an explicit knot vector must reproduce the fit that built
+        it. The sim branch of subtract_hwpss_spline relies on this to apply the
+        same filter to a simulation as was applied to the data, since
+        samples_per_knot is not recoverable from the archived stats.
+        """
+        tod, _, _ = make_fake_tod_spline(n_knots=6)
+        kw = dict(modes=[2, 4], degree=3, apply_prefilt=False,
+                  merge_stats=False, merge_model=False)
+        a = hwp.get_hwpss_spline(tod, n_knots=6, **kw)
+        b = hwp.get_hwpss_spline(tod, knots=a.knots, **kw)
+        np.testing.assert_array_equal(a.knots, b.knots)
+        np.testing.assert_array_equal(a.coeffs, b.coeffs)
+
+        # a different grid really is a different fit, so the above is not
+        # trivially true
+        c = hwp.get_hwpss_spline(tod, n_knots=20, **kw)
+        self.assertNotEqual(a.coeffs.shape[-1], c.coeffs.shape[-1])
+
     def test_spline_stats_coexist_with_hwpss_stats(self):
         """The spline stats must not collide with the standard HWPSS stats
         when both are wrapped into one AxisManager, as the preprocessing
@@ -199,6 +218,66 @@ class HwpssSplineTest(unittest.TestCase):
 
         self.assertEqual(proc.post_hwpss_stats.coeffs.shape[1], 16)
         self.assertEqual(proc.post_hwpss_stats_spline.coeffs.shape[1], 4)
+
+
+class HWPSSSplinePipelineTest(unittest.TestCase):
+    """The merged hwpss_spline preprocess step, across its three paths."""
+
+    CFG = [{'name': 'hwpss_spline', 'skip_on_sim': False,
+            'calc': {'modes': [2, 4], 'degree': 3, 'n_knots': 6,
+                     'apply_prefilt': False,
+                     'hwpss_stats_name': 'stats_spline', 'merge_model': False},
+            'save': True,
+            'process': {'subtract': True, 'subtract_name': 'signal',
+                        'hwpss_model_name': 'hwpss_model_spline'}}]
+
+    def _tod(self, **kw):
+        tod, true_coeffs, _ = make_fake_tod_spline(n_knots=6, **kw)
+        # Pipeline.run reads this to work out filter cutoffs
+        tod.wrap('iir_params', core.AxisManager())
+        return tod, true_coeffs
+
+    def test_calc_pass_subtracts_and_archives(self):
+        """On the archive-generating pass the step must both fit and subtract.
+        Pipeline.run calls process() before calc_and_save(), so a step that
+        only subtracts from archived stats would silently leave the HWPSS in
+        for every later step of that run.
+        """
+        from sotodlib.preprocess.pcore import Pipeline
+        tod, true_coeffs = self._tod()
+        before = np.std(tod.signal)
+        proc_aman, success = Pipeline(self.CFG).run(tod)
+        self.assertEqual(success, 'end')
+        self.assertIn('stats_spline', proc_aman)
+        np.testing.assert_allclose(proc_aman.stats_spline.coeffs, true_coeffs,
+                                   atol=1e-6)
+        self.assertLess(np.std(tod.signal), 1e-6 * before)
+
+    def test_load_pass_uses_archived_coeffs(self):
+        """Re-running with saved stats must subtract without refitting."""
+        from sotodlib.preprocess.pcore import Pipeline
+        pipe = Pipeline(self.CFG)
+        tod, _ = self._tod()
+        proc_aman, _ = pipe.run(tod)
+
+        tod2, _ = self._tod()
+        before = np.std(tod2.signal)
+        pipe.run(tod2, proc_aman)
+        self.assertLess(np.std(tod2.signal), 1e-6 * before)
+
+    def test_sim_pass_refits_on_the_sim(self):
+        """On sims the archived coefficients describe the data, so the fit is
+        redone on the sim -- a different realization must still be removed.
+        """
+        from sotodlib.preprocess.pcore import Pipeline
+        pipe = Pipeline(self.CFG)
+        tod, _ = self._tod()
+        proc_aman, _ = pipe.run(tod)
+
+        sim, _ = self._tod(seed=7)
+        before = np.std(sim.signal)
+        pipe.run(sim, proc_aman, sim=True)
+        self.assertLess(np.std(sim.signal), 1e-6 * before)
 
 
 if __name__ == '__main__':

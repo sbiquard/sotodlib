@@ -585,7 +585,7 @@ def _build_knot_vector(x, n_knots, degree=3):
 
 
 def get_bspline_design_matrix(x, n_knots=None, samples_per_knot=4000, degree=3,
-                               min_knots=2, extrapolate=False):
+                               min_knots=2, extrapolate=False, knots=None):
     """
     Build the sparse local-support B-spline design matrix for sample
     locations `x` (typically `aman.timestamps`).
@@ -607,6 +607,11 @@ def get_bspline_design_matrix(x, n_knots=None, samples_per_knot=4000, degree=3,
         Whether to allow evaluating the basis outside [x[0], x[-1]]. Default
         False, which raises if this is ever attempted (e.g. when rebuilding a
         template on samples outside the domain the spline was originally fit on).
+    knots : array-like, optional
+        A ready-made clamped knot vector to use as-is, bypassing the uniform
+        grid built from `n_knots`/`samples_per_knot`. Use this to reproduce the
+        exact grid of an earlier fit, e.g. when re-deriving the same filter on
+        a simulation.
 
     Returns
     -------
@@ -617,9 +622,12 @@ def get_bspline_design_matrix(x, n_knots=None, samples_per_knot=4000, degree=3,
         The full clamped knot vector, needed to re-evaluate the basis later.
     """
     x = np.asarray(x)
-    if n_knots is None:
-        n_knots = max(min_knots, len(x) // samples_per_knot)
-    knots = _build_knot_vector(x, n_knots, degree)
+    if knots is None:
+        if n_knots is None:
+            n_knots = max(min_knots, len(x) // samples_per_knot)
+        knots = _build_knot_vector(x, n_knots, degree)
+    else:
+        knots = np.asarray(knots, dtype=float)
     B = BSpline.design_matrix(x, knots, degree, extrapolate=extrapolate)
     return B, knots
 
@@ -774,7 +782,7 @@ def _get_hwpss_weights(aman, flags, apodize_edges, apodize_edges_samps,
 
 def get_hwpss_spline(aman, signal=None, hwp_angle=None, timestamps=None,
                       modes=[2, 4],
-                      degree=3, n_knots=None, samples_per_knot=10000,
+                      degree=3, n_knots=None, samples_per_knot=10000, knots=None,
                       apply_prefilt=True, prefilt_cfg=None, prefilt_detrend='linear',
                       flags=None,
                       apodize_edges=True, apodize_edges_samps=1600,
@@ -822,6 +830,9 @@ def get_hwpss_spline(aman, signal=None, hwp_angle=None, timestamps=None,
     samples_per_knot : int, optional
         Used to auto-compute `n_knots` when not given explicitly, as
         ``max(2, n_samps // samples_per_knot)``. Default is 10000.
+    knots : array-like, optional
+        A ready-made clamped knot vector, overriding `n_knots` and
+        `samples_per_knot`. See `get_bspline_design_matrix`.
     apply_prefilt : bool, optional
         Whether to apply a high-pass filter to signal before extracting HWPSS. Default is `True`.
         IMPORTANT: the default high-pass cutoff (1.0 Hz) will suppress slow
@@ -902,7 +913,8 @@ def get_hwpss_spline(aman, signal=None, hwp_angle=None, timestamps=None,
                             apodize_flags, apodize_flags_samps, apo_type)
 
     B, knots = get_bspline_design_matrix(
-        timestamps, n_knots=n_knots, samples_per_knot=samples_per_knot, degree=degree
+        timestamps, n_knots=n_knots, samples_per_knot=samples_per_knot, degree=degree,
+        knots=knots
     )
     n_dets = signal.shape[0]
     n_bases = B.shape[1]
