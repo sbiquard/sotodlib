@@ -181,6 +181,25 @@ class HwpssSplineTest(unittest.TestCase):
         err_per_det = np.max(np.abs(tod.hwpss_stats_spline.coeffs - true_coeffs), axis=(1, 2))
         self.assertTrue(np.all(err_per_det < 1e-5))
 
+    def test_spline_stats_coexist_with_hwpss_stats(self):
+        """The spline stats must not collide with the standard HWPSS stats
+        when both are wrapped into one AxisManager, as the preprocessing
+        pipeline does. They carry different numbers of modes, so sharing an
+        axis name silently truncates or fails to broadcast.
+        """
+        tod, _, _ = make_fake_tod_spline()
+        hwp.get_hwpss(tod, modes=np.arange(8) + 1, bin_signal=False)
+        hwp.get_hwpss_spline(tod, modes=[2, 4], degree=3, n_knots=6,
+                             apply_prefilt=False,
+                             hwpss_model_name='hwpss_model_spline')
+
+        proc = core.AxisManager(tod.dets, tod.samps)
+        proc.wrap('post_hwpss_stats', tod.hwpss_stats)
+        proc.wrap('post_hwpss_stats_spline', tod.hwpss_stats_spline)
+
+        self.assertEqual(proc.post_hwpss_stats.coeffs.shape[1], 16)
+        self.assertEqual(proc.post_hwpss_stats_spline.coeffs.shape[1], 4)
+
 
 if __name__ == '__main__':
     unittest.main()

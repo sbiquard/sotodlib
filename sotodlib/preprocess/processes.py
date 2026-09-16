@@ -1291,7 +1291,7 @@ class SubtractHWPSSSpline(_Preprocess):
             raise NotImplementedError("No support for using data AxisManager in process")
         if proc_aman[self.hwpss_stats] is not None:
             stats = proc_aman[self.hwpss_stats]
-            modes = [int(m[1:]) for m in stats.modes.vals[::2]]
+            modes = [int(m[1:]) for m in stats.spline_modes.vals[::2]]
             degree = int(stats.degree)
             if sim:
                 hwpss_stats = hwp.get_hwpss_spline(aman, merge_stats=False, merge_model=False,

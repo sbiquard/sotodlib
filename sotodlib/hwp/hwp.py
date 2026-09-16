@@ -958,11 +958,11 @@ def get_hwpss_spline(aman, signal=None, hwp_angle=None, timestamps=None,
 
     hwpss_stats = core.AxisManager(
         aman.dets,
-        core.LabelAxis(name='modes', vals=np.array(mode_names, dtype='<U3')),
+        core.LabelAxis(name='spline_modes', vals=np.array(mode_names, dtype='<U3')),
         core.IndexAxis('spline_basis', count=n_bases),
         core.IndexAxis('knot_grid', count=len(knots)),
     )
-    hwpss_stats.wrap('coeffs', coeffs, [(0, 'dets'), (1, 'modes'), (2, 'spline_basis')])
+    hwpss_stats.wrap('coeffs', coeffs, [(0, 'dets'), (1, 'spline_modes'), (2, 'spline_basis')])
     hwpss_stats.wrap('knots', knots, [(0, 'knot_grid')])
     hwpss_stats.wrap('degree', degree)
     hwpss_stats.wrap('sigma_tod', sigma_tod, [(0, 'dets')])
