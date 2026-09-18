@@ -95,6 +95,61 @@ class TestDbBatchManager(unittest.TestCase):
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
 
+    def test_callbacks_run_only_after_commit(self):
+        temp_dir = tempfile.mkdtemp()
+        db_path = os.path.join(temp_dir, 'test.db')
+        try:
+            scheme = ManifestScheme()
+            scheme.add_exact_match('obs:obs_id')
+            scheme.add_data_field('dataset')
+            db = ManifestDb(db_path, scheme=scheme)
+            callbacks = []
+
+            with DbBatchManager(db, batch_size=2) as manager:
+                manager.add_entry(
+                    {'obs:obs_id': 'obs0', 'dataset': 'data0'},
+                    'file0.h5',
+                    on_commit=lambda: callbacks.append('obs0'),
+                )
+                self.assertEqual(callbacks, [])
+                manager.add_entry(
+                    {'obs:obs_id': 'obs1', 'dataset': 'data1'},
+                    'file1.h5',
+                    on_commit=lambda: callbacks.append('obs1'),
+                )
+                self.assertEqual(callbacks, ['obs0', 'obs1'])
+
+            db.conn.close()
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_replace_updates_filename(self):
+        temp_dir = tempfile.mkdtemp()
+        db_path = os.path.join(temp_dir, 'test.db')
+        try:
+            scheme = ManifestScheme()
+            scheme.add_exact_match('obs:obs_id')
+            scheme.add_data_field('dataset')
+            db = ManifestDb(db_path, scheme=scheme)
+            params = {'obs:obs_id': 'obs0', 'dataset': 'data0'}
+            db.add_entry(params, 'old.h5')
+            callbacks = []
+
+            with DbBatchManager(db, batch_size=10) as manager:
+                manager.add_entry(
+                    params,
+                    'new.h5',
+                    replace=True,
+                    on_commit=lambda: callbacks.append('committed'),
+                )
+                self.assertEqual(callbacks, [])
+
+            self.assertEqual(callbacks, ['committed'])
+            self.assertEqual(db.inspect(params)[0]['filename'], 'new.h5')
+            db.conn.close()
+        finally:
+            shutil.rmtree(temp_dir)
+
 
 class TestMultiDbBatchManager(unittest.TestCase):
     """Test the MultiDbBatchManager class."""

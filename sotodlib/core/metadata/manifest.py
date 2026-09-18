@@ -47,7 +47,7 @@ import sys
 import json
 import argparse
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from . import common, resultset
 
@@ -834,6 +834,7 @@ class DbBatchManager:
         self.db = db
         self.batch_size = batch_size
         self.batch_counter = 0
+        self._post_commit_callbacks = []
 
         if logger is None:
             self.logger = logging.getLogger('DbBatchManager')
@@ -855,6 +856,7 @@ class DbBatchManager:
         filename: str | None = None,
         create: bool = True,
         replace: bool = False,
+        on_commit: Callable[[], None] | None = None,
     ) -> None:
         """Add an entry to the database, committing only when batch size is reached.
 
@@ -868,30 +870,48 @@ class DbBatchManager:
             If False, do not create new entry in the file table.
         replace : bool
             If True, replace existing entry if it exists.
+        on_commit : callable, optional
+            Function to call after the transaction containing this entry has
+            committed. If the entry already exists and ``replace`` is False,
+            the callback runs immediately.
         """
         # Check if entry already exists to avoid duplicates
         existing_entries = self.db.inspect(params)
-        if len(existing_entries) == 0:
+        if replace or len(existing_entries) == 0:
             # Add the entry without committing
             self.db.add_entry(
                 params, filename=filename, create=create, commit=False, replace=replace
             )
             self.batch_counter += 1
+            if on_commit is not None:
+                self._post_commit_callbacks.append(on_commit)
 
             # Commit if we've reached the batch size
             if self.batch_counter >= self.batch_size:
                 self.logger.info(f'Committing batch of {self.batch_counter} operations')
-                self.db.conn.commit()
-                self.batch_counter = 0
+                self._commit()
         else:
             self.logger.debug(f'Entry already exists for {params}, skipping')
+            if on_commit is not None:
+                on_commit()
+
+    def _commit(self) -> None:
+        """Commit pending entries, then run their publication callbacks."""
+        self.db.conn.commit()
+        callbacks = self._post_commit_callbacks
+        self._post_commit_callbacks = []
+        self.batch_counter = 0
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                self.logger.exception("Post-commit callback failed")
 
     def force_commit(self) -> None:
         """Force a commit of any pending operations."""
         if self.batch_counter > 0:
             self.logger.info(f'Forced commit of {self.batch_counter} batched operations')
-            self.db.conn.commit()
-            self.batch_counter = 0
+            self._commit()
 
 
 class MultiDbBatchManager:
