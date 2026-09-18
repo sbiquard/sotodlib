@@ -19,11 +19,25 @@ from sotodlib.site_pipeline.jobdb import JobManager, JState
 from sotodlib.preprocess import _Preprocess, Pipeline, processes
 import sotodlib.preprocess.preprocess_util as pp_util
 from sotodlib.preprocess.preprocess_util import PreprocessErrors
+from sotodlib.preprocess.archive_writer import ArchivePublisher
 from sotodlib.site_pipeline.utils.pipeline import main_launcher
 from sotodlib.site_pipeline.utils.obsdb import get_obslist
 
 
 logger = pp_util.init_logger("preprocess")
+
+
+def _update_jobdb(jdb, jclass, obs_id, group, group_by, state, error=None):
+    tags = {"obs:obs_id": obs_id}
+    tags.update({f"dets:{gb}": g for gb, g in zip(group_by, group)})
+    jobs = jdb.get_jobs(jclass=jclass, jstate=JState.open, tags=tags)
+    for job in jobs:
+        with jdb.locked(job) as locked_job:
+            locked_job.mark_visited()
+            locked_job.jstate = state
+            for tag in locked_job._tags:
+                if tag.key == "error":
+                    tag.value = error
 
 
 def multilayer_preprocess_tod(obs_id: str,
@@ -405,12 +419,32 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
 
     batch_size_init = configs_init['archive'].get('batch_size', 1)
     batch_size_proc = configs_proc['archive'].get('batch_size', 1)
+    writer_lanes_init = configs_init['archive'].get('writer_lanes', 0)
+    writer_lanes_proc = configs_proc['archive'].get('writer_lanes', 0)
+    configured_lanes = {x for x in (writer_lanes_init, writer_lanes_proc) if x}
+    if len(configured_lanes) > 1:
+        raise ValueError("init and proc archive writer_lanes must match")
+    writer_lanes = configured_lanes.pop() if configured_lanes else 0
+    writer_queue_depth = max(
+        configs_init['archive'].get('writer_queue_depth', 8),
+        configs_proc['archive'].get('writer_queue_depth', 8),
+    )
+    publication_records = []
 
     pb_name = os.path.join(pb_path or '', f"pb_{str(int(time.time()))}.txt")
     with open(pb_name, 'w') as f:
         with MultiDbBatchManager(
             [db_init, db_proc], batch_size=[batch_size_init, batch_size_proc], logger=logger
         ) as (db_mgr_init, db_mgr_proc):
+            publisher = None
+            if writer_lanes:
+                publisher = ArchivePublisher(
+                    configs={"init": configs_init, "proc": configs_proc},
+                    db_managers={"init": db_mgr_init, "proc": db_mgr_proc},
+                    lane_count=writer_lanes,
+                    queue_depth=writer_queue_depth,
+                    overwrite=overwrite,
+                )
             for future in tqdm(as_completed_callable(futures), total=total,
                                 desc="multilayer_preprocess_tod", file=f,
                                 miniters=max(1, total // 100)):
@@ -418,49 +452,101 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
                 out_meta = (obs_id, group)
                 try:
                     out_dict_init, out_dict_proc, errors = future.result()
-                    obs_errors[obs_id].append({'group': group, 'error': errors[0]})
                     logger.info(f"{obs_id}: {group} extracted successfully")
                 except Exception as e:
                     errmsg, tb = PreprocessErrors.get_errors(e)
                     logger.error(f"Executor Future Result Error for {obs_id}: {group}:\n{errmsg}\n{tb}")
-                    obs_errors[obs_id].append({'group': group, 'error': PreprocessErrors.ExecutorFutureError})
                     out_dict_init = None
                     out_dict_proc = None
                     errors = (PreprocessErrors.ExecutorFutureError, errmsg, tb)
 
                 futures.remove(future)
 
-                # only run if first layer was run
-                if out_dict_init is not None:
-                    logger.info(f"Adding future result to init db for {obs_id}: {group}")
-                    pp_util.cleanup_mandb(out_dict_init, out_meta, errors,
-                                        configs_init, logger, overwrite,
-                                        db_manager=db_mgr_init)
-                logger.info(f"Adding future result to proc db for {obs_id}: {group}")
-                pp_util.cleanup_mandb(out_dict_proc, out_meta, errors,
-                                    configs_proc, logger, overwrite,
-                                    db_manager=db_mgr_proc)
+                compute_error = errors[0]
+                compute_succeeded = compute_error in (
+                    None, PreprocessErrors.LoadSuccess
+                )
+                record = {
+                    'obs_id': obs_id,
+                    'group': group,
+                    'error': None if compute_succeeded else compute_error,
+                    'compute_error': None if compute_succeeded else compute_error,
+                    'layers': {
+                        'init': {
+                            'committed': out_dict_init is None and compute_succeeded,
+                            'archive_error': None,
+                        },
+                        'proc': {
+                            'committed': out_dict_proc is None and compute_succeeded,
+                            'archive_error': None,
+                        },
+                    },
+                }
+                publication_records.append(record)
+                obs_errors[obs_id].append(record)
 
-                # update jobdb
-                if jobdb_path is not None:
-                    tags = {}
-                    tags["obs:obs_id"] = obs_id
-                    for gb, g in zip(group_by, group):
-                        tags['dets:' + gb] = g
-                    jobs = jdb.get_jobs(jstate=JState.open, tags=tags)
+                for archive_name, out_dict, config, db_manager in (
+                    ("init", out_dict_init, configs_init, db_mgr_init),
+                    ("proc", out_dict_proc, configs_proc, db_mgr_proc),
+                ):
+                    if out_dict is None:
+                        continue
+                    if publisher is not None:
+                        publisher.submit(
+                            archive_name,
+                            out_dict,
+                            token=(record, archive_name),
+                        )
+                    else:
+                        pp_util.cleanup_mandb(
+                            out_dict, out_meta, errors, config, logger,
+                            overwrite, db_manager=db_manager,
+                        )
+                        record['layers'][archive_name]['committed'] = True
 
-                    for job in jobs:
-                        # init layer state will be JState.done if already run
-                        if job.jstate == JState.open:
-                            with jdb.locked(job) as j:
-                                j.mark_visited()
-                                if errors[0] is not None:
-                                    j.jstate = JState.failed
-                                    for _t in j._tags:
-                                        if _t.key == "error":
-                                            _t.value = errors[0]
-                                else:
-                                    j.jstate = JState.done
+            if publisher is not None:
+                def archive_committed(token, result):
+                    record, archive_name = token
+                    record['layers'][archive_name]['committed'] = True
+
+                def archive_failed(token, result):
+                    record, archive_name = token
+                    record['layers'][archive_name]['archive_error'] = result.error
+                    if record['error'] is None:
+                        record['error'] = PreprocessErrors.ArchiveWriteError
+                    logger.error(
+                        f"{archive_name} archive writer failed for "
+                        f"{record['obs_id']}:{record['group']}: "
+                        f"{result.error}\n{result.traceback}"
+                    )
+
+                publisher.finish(archive_committed, archive_failed)
+
+    if jobdb_path is not None:
+        for record in publication_records:
+            for jclass in ("init", "proc"):
+                layer = record['layers'][jclass]
+                if layer['archive_error'] is not None:
+                    state = JState.open
+                    error = PreprocessErrors.ArchiveWriteError
+                elif layer['committed']:
+                    state = JState.done
+                    error = None
+                elif record['compute_error'] is not None:
+                    state = JState.failed
+                    error = record['compute_error']
+                else:
+                    state = JState.open
+                    error = PreprocessErrors.ArchiveWriteError
+                _update_jobdb(
+                    jdb,
+                    jclass,
+                    record['obs_id'],
+                    record['group'],
+                    group_by,
+                    state,
+                    error=error,
+                )
     if raise_error:
         n_obs_fail = 0
         n_groups_fail = 0

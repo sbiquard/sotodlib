@@ -17,6 +17,7 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import h5py
@@ -310,7 +311,12 @@ class ArchiveWriterPool:
         if request.request_id in self._pending:
             raise ValueError(f"Duplicate request id {request.request_id}")
         lane = lane_for_dataset(request.db_data["dataset"], self.lane_count)
-        self._request_queues[lane].put(request)
+        while True:
+            try:
+                self._request_queues[lane].put(request, timeout=1)
+                break
+            except queue.Full:
+                self.check_health()
         self._pending.add(request.request_id)
         return request.request_id
 
@@ -326,6 +332,22 @@ class ArchiveWriterPool:
                 results.append(self.get_result(block=False))
             except queue.Empty:
                 return results
+
+    def iter_results(self):
+        while self._pending:
+            try:
+                yield self.get_result(timeout=1)
+            except queue.Empty:
+                self.check_health()
+
+    def check_health(self):
+        failures = [
+            f"{process.name} exited with {process.exitcode}"
+            for process in self._processes
+            if process.exitcode not in (None, 0)
+        ]
+        if failures:
+            raise RuntimeError("; ".join(failures))
 
     def close_submissions(self):
         if self._closed:
@@ -346,9 +368,86 @@ class ArchiveWriterPool:
         if failures:
             raise RuntimeError("; ".join(failures))
 
+    def terminate(self):
+        self._closed = True
+        for process in self._processes:
+            if process.is_alive():
+                process.terminate()
+        for process in self._processes:
+            process.join()
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, exc_tb):
-        self.join()
+        if exc_type is None:
+            self.join()
+        else:
+            self.terminate()
         return False
+
+
+class ArchivePublisher:
+    """Connect archive writer results to rank-zero manifest managers."""
+
+    def __init__(
+        self,
+        configs,
+        db_managers,
+        lane_count=4,
+        queue_depth=8,
+        overwrite=False,
+    ):
+        self.configs = configs
+        self.db_managers = db_managers
+        self.overwrite = overwrite
+        self.writers = ArchiveWriterPool(
+            lane_count=lane_count,
+            queue_depth=queue_depth,
+        )
+        self._tokens = {}
+
+    def submit(self, archive_name, out_dict, token, recover=False):
+        request = request_from_output(
+            archive_name,
+            out_dict,
+            self.configs[archive_name],
+            overwrite=self.overwrite,
+            recover=recover,
+        )
+        self._tokens[request.request_id] = token
+        self.writers.submit(request)
+        return request.request_id
+
+    @staticmethod
+    def _after_commit(result, token, callback):
+        callback(token, result)
+        try:
+            os.remove(result.temp_file)
+        except FileNotFoundError:
+            pass
+
+    def finish(self, on_commit, on_error):
+        """Drain writers and stage successful results in manifest batches."""
+        self.writers.close_submissions()
+        try:
+            for result in self.writers.iter_results():
+                token = self._tokens.pop(result.request_id)
+                if result.success:
+                    self.db_managers[result.archive_name].add_entry(
+                        result.db_data,
+                        result.h5_path,
+                        replace=self.overwrite,
+                        on_commit=partial(
+                            self._after_commit,
+                            result,
+                            token,
+                            on_commit,
+                        ),
+                    )
+                else:
+                    on_error(token, result)
+            self.writers.join()
+        except Exception:
+            self.writers.terminate()
+            raise

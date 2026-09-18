@@ -42,6 +42,7 @@ class PreprocessErrors:
     NoInitDbError = "no_init_db_error"
     GroupOutputError = "group_output_error"
     ExecutorFutureError = "executor_future_error"
+    ArchiveWriteError = "archive_write_error"
     SkipMissingError = "skip_missing_error"
 
     @classmethod
@@ -1047,21 +1048,36 @@ def cleanup_archive(configs, logger=None):
         archive_files = list(
             Path(os.path.dirname(configs["archive"]["policy"]["filename"])).rglob(f"{basename}*.h5")
         )
-        pattern = re.compile(r"\d+")
-        archive_files = [p for p in archive_files if pattern.findall(p.stem)]
+        legacy_pattern = re.compile(r"_(\d+)$")
+        lane_pattern = re.compile(r"_lane(\d+)_(\d+)$")
+        latest = {}
+        for archive_file in archive_files:
+            lane_match = lane_pattern.search(archive_file.stem)
+            if lane_match:
+                lane = int(lane_match.group(1))
+                sequence = int(lane_match.group(2))
+                key = ("lane", lane)
+            else:
+                sequence_match = legacy_pattern.search(archive_file.stem)
+                if sequence_match is None:
+                    continue
+                sequence = int(sequence_match.group(1))
+                key = ("legacy", 0)
+            if key not in latest or sequence > latest[key][0]:
+                latest[key] = (sequence, archive_file)
 
-        if archive_files:
-            latest_file = max([(int(pattern.findall(p.stem)[-1]), p)
-                               for p in archive_files if pattern.findall(p.stem)],
-                              key=lambda t: t[0])[1]
-
-            db_datasets = [d['dataset'] for d in db.inspect()]
-            with H5ContextManager(latest_file, mode="r+") as f:
-                keys = list(f.keys())
-                for key in keys:
-                    if key not in db_datasets:
-                        logger.debug(f"{key} not found in db. deleting it from {latest_file}.")
-                        del f[key]
+        if latest:
+            db_datasets = {d['dataset'] for d in db.inspect()}
+            for _, latest_file in latest.values():
+                with H5ContextManager(latest_file, mode="r+") as f:
+                    keys = list(f.keys())
+                    for key in keys:
+                        if key not in db_datasets:
+                            logger.debug(
+                                f"{key} not found in db. deleting it from "
+                                f"{latest_file}."
+                            )
+                            del f[key]
 
         db.conn.close()
 

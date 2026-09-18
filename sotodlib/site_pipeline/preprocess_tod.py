@@ -20,10 +20,24 @@ from sotodlib.site_pipeline.utils.pipeline import main_launcher
 from sotodlib.site_pipeline.utils.obsdb import get_obslist
 from sotodlib.preprocess import preprocess_util as pp_util
 from sotodlib.preprocess.preprocess_util import PreprocessErrors
+from sotodlib.preprocess.archive_writer import ArchivePublisher
 from sotodlib.preprocess import _Preprocess, Pipeline, processes
 
 
 logger = pp_util.init_logger("preprocess")
+
+
+def _update_jobdb(jdb, obs_id, group, group_by, state, error=None):
+    tags = {"obs:obs_id": obs_id}
+    tags.update({f"dets:{gb}": g for gb, g in zip(group_by, group)})
+    jobs = jdb.get_jobs(jclass="init", jstate=JState.open, tags=tags)
+    for job in jobs:
+        with jdb.locked(job) as locked_job:
+            locked_job.mark_visited()
+            locked_job.jstate = state
+            for tag in locked_job._tags:
+                if tag.key == "error":
+                    tag.value = error
 
 
 def load_preprocess_tod_sim(obs_id,
@@ -320,10 +334,22 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
 
     # batch updates to ManifestDb
     batch_size = configs['archive'].get('batch_size', 1)
+    writer_lanes = configs['archive'].get('writer_lanes', 0)
+    writer_queue_depth = configs['archive'].get('writer_queue_depth', 8)
+    publication_records = []
 
     pb_name = os.path.join(pb_path or '', f"pb_{str(int(time.time()))}.txt")
     with open(pb_name, 'w') as f:
         with DbBatchManager(db, batch_size=batch_size, logger=logger) as db_manager:
+            publisher = None
+            if writer_lanes:
+                publisher = ArchivePublisher(
+                    configs={"init": configs},
+                    db_managers={"init": db_manager},
+                    lane_count=writer_lanes,
+                    queue_depth=writer_queue_depth,
+                    overwrite=overwrite,
+                )
             for future in tqdm(as_completed_callable(futures), total=total,
                             desc="preprocess_tod", file=f,
                             miniters=max(1, total // 100)):
@@ -331,36 +357,66 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
                 out_meta = (obs_id, group)
                 try:
                     out_dict, errors = future.result()
-                    obs_errors[obs_id].append({'group': group, 'error': errors[0]})
                     logger.info(f"{obs_id}: {group} extracted successfully")
                 except Exception as e:
                     errmsg, tb = PreprocessErrors.get_errors(e)
                     logger.error(f"Executor Future Result Error for {obs_id}: {group}:\n{errmsg}\n{tb}")
-                    obs_errors[obs_id].append({'group': group, 'error': PreprocessErrors.ExecutorFutureError})
                     out_dict = None
                     errors = (PreprocessErrors.ExecutorFutureError, errmsg, tb)
 
                 futures.remove(future)
 
-                pp_util.cleanup_mandb(out_dict, out_meta, errors, configs,
-                                    logger, overwrite, db_manager=db_manager)
+                record = {
+                    'obs_id': obs_id,
+                    'group': group,
+                    'error': errors[0],
+                    'archive_committed': out_dict is None,
+                }
+                publication_records.append(record)
+                obs_errors[obs_id].append(record)
 
-                # update jobdb
-                if jobdb_path is not None:
-                    tags = {}
-                    tags["obs:obs_id"] = obs_id
-                    for gb, g in zip(group_by, group):
-                        tags['dets:' + gb] = g
-                    job = jdb.get_jobs(jclass="init", jstate=JState.open, tags=tags)
-                    with jdb.locked(job) as j:
-                        j.mark_visited()
-                        if errors[0] is not None:
-                            j.jstate = JState.failed
-                            for _t in j._tags:
-                                if _t.key == "error":
-                                    _t.value = errors[0]
-                        else:
-                            j.jstate = JState.done
+                if publisher is not None and out_dict is not None:
+                    publisher.submit("init", out_dict, token=record)
+                elif out_dict is not None:
+                    pp_util.cleanup_mandb(
+                        out_dict, out_meta, errors, configs,
+                        logger, overwrite, db_manager=db_manager,
+                    )
+                    record['archive_committed'] = True
+
+            if publisher is not None:
+                def archive_committed(record, result):
+                    record['archive_committed'] = True
+
+                def archive_failed(record, result):
+                    record['error'] = PreprocessErrors.ArchiveWriteError
+                    record['archive_error'] = result.error
+                    logger.error(
+                        f"Archive writer failed for {record['obs_id']}:"
+                        f"{record['group']}: {result.error}\n{result.traceback}"
+                    )
+
+                publisher.finish(archive_committed, archive_failed)
+
+    if jobdb_path is not None:
+        for record in publication_records:
+            if record['error'] == PreprocessErrors.ArchiveWriteError:
+                state = JState.open
+            elif record['error'] is not None:
+                state = JState.failed
+            elif record['archive_committed']:
+                state = JState.done
+            else:
+                state = JState.open
+                record['error'] = PreprocessErrors.ArchiveWriteError
+            _update_jobdb(
+                jdb,
+                record['obs_id'],
+                record['group'],
+                group_by,
+                state,
+                error=record['error'],
+            )
 
     if raise_error:
         n_obs_fail = 0

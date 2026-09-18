@@ -6,10 +6,16 @@ import h5py
 import numpy as np
 
 from sotodlib.preprocess.archive_writer import (
+    ArchivePublisher,
     ArchiveRequest,
     ArchiveWriterPool,
     lane_for_dataset,
     publish_archive_request,
+)
+from sotodlib.core.metadata.manifest import (
+    DbBatchManager,
+    ManifestDb,
+    ManifestScheme,
 )
 
 
@@ -91,6 +97,46 @@ class TestArchiveWriter(unittest.TestCase):
         self.assertNotEqual(first_result.archive_file, second_result.archive_file)
         self.assertTrue(first_result.archive_file.endswith("_000.h5"))
         self.assertTrue(second_result.archive_file.endswith("_001.h5"))
+
+    def test_publisher_removes_temp_only_after_manifest_commit(self):
+        scheme = ManifestScheme()
+        scheme.add_exact_match('obs:obs_id')
+        scheme.add_data_field('dataset')
+        db = ManifestDb(self.index, scheme=scheme)
+        request = self.make_request("obs0", 4)
+        committed = []
+        failed = []
+
+        with DbBatchManager(db, batch_size=10) as db_manager:
+            publisher = ArchivePublisher(
+                configs={
+                    "init": {
+                        "archive": {
+                            "index": self.index,
+                            "policy": {"filename": self.archive_base},
+                        }
+                    }
+                },
+                db_managers={"init": db_manager},
+                lane_count=1,
+            )
+            publisher.submit(
+                "init",
+                {"temp_file": request.temp_file, "db_data": request.db_data},
+                token="job0",
+            )
+            publisher.finish(
+                on_commit=lambda token, result: committed.append(token),
+                on_error=lambda token, result: failed.append(token),
+            )
+            self.assertTrue(os.path.exists(request.temp_file))
+            self.assertEqual(committed, [])
+
+        self.assertEqual(committed, ["job0"])
+        self.assertEqual(failed, [])
+        self.assertFalse(os.path.exists(request.temp_file))
+        self.assertEqual(db.inspect({"obs:obs_id": "obs0"})[0]["dataset"], "obs0")
+        db.conn.close()
 
 
 if __name__ == "__main__":
