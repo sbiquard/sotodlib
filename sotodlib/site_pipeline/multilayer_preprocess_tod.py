@@ -40,6 +40,105 @@ def _update_jobdb(jdb, jclass, obs_id, group, group_by, state, error=None):
                     tag.value = error
 
 
+def _recover_temp_files(
+    obs_list,
+    configs,
+    contexts,
+    temp_subdirs,
+    group_by,
+    writer_lanes,
+    writer_queue_depth,
+    jdb,
+    logger,
+):
+    pending = []
+    for archive_name in ("init", "proc"):
+        for obs_id in obs_list:
+            outputs, _ = pp_util.get_temp_group_outputs(
+                obs_id,
+                configs[archive_name],
+                context=contexts[archive_name],
+                subdir=temp_subdirs[archive_name],
+            )
+            pending.extend(
+                (archive_name, out_dict, out_meta)
+                for out_dict, out_meta in outputs
+            )
+    if not pending:
+        return
+
+    logger.info(f"Recovering {len(pending)} temporary preprocessing files")
+    db_init = pp_util.get_preprocess_db(configs["init"], group_by, logger)
+    db_proc = pp_util.get_preprocess_db(configs["proc"], group_by, logger)
+    records = {}
+    batch_sizes = [
+        configs["init"]['archive'].get('batch_size', 1),
+        configs["proc"]['archive'].get('batch_size', 1),
+    ]
+    with MultiDbBatchManager(
+        [db_init, db_proc], batch_size=batch_sizes, logger=logger
+    ) as (db_mgr_init, db_mgr_proc):
+        publisher = ArchivePublisher(
+            configs=configs,
+            db_managers={"init": db_mgr_init, "proc": db_mgr_proc},
+            lane_count=writer_lanes,
+            queue_depth=writer_queue_depth,
+        )
+        for archive_name, out_dict, (obs_id, group) in pending:
+            key = (obs_id, tuple(group))
+            record = records.setdefault(
+                key,
+                {
+                    'obs_id': obs_id,
+                    'group': group,
+                    'layers': {
+                        'init': {'committed': False, 'error': None},
+                        'proc': {'committed': False, 'error': None},
+                    },
+                },
+            )
+            publisher.submit(
+                archive_name,
+                out_dict,
+                token=(record, archive_name),
+                recover=True,
+            )
+
+        def committed(token, result):
+            record, archive_name = token
+            record['layers'][archive_name]['committed'] = True
+
+        def failed(token, result):
+            record, archive_name = token
+            record['layers'][archive_name]['error'] = result.error
+            logger.error(
+                f"{archive_name} archive recovery failed for "
+                f"{record['obs_id']}:{record['group']}: "
+                f"{result.error}\n{result.traceback}"
+            )
+
+        publisher.finish(committed, failed)
+    db_init.conn.close()
+    db_proc.conn.close()
+
+    if jdb is not None:
+        for record in records.values():
+            for jclass in ("init", "proc"):
+                layer = record['layers'][jclass]
+                if not layer['committed'] and layer['error'] is None:
+                    continue
+                _update_jobdb(
+                    jdb,
+                    jclass,
+                    record['obs_id'],
+                    record['group'],
+                    group_by,
+                    JState.done if layer['committed'] else JState.open,
+                    error=(None if layer['committed']
+                           else PreprocessErrors.ArchiveWriteError),
+                )
+
+
 def multilayer_preprocess_tod(obs_id: str,
                               configs_init: Union[str, dict],
                               configs_proc: Union[str, dict],
@@ -216,6 +315,17 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
     configs_proc, context_proc = pp_util.get_preprocess_context(configs_proc)
 
     logger = pp_util.init_logger("preprocess", verbosity=verbosity)
+    group_by = np.atleast_1d(configs_proc['subobs'].get('use', 'detset'))
+    writer_lanes_init = configs_init['archive'].get('writer_lanes', 0)
+    writer_lanes_proc = configs_proc['archive'].get('writer_lanes', 0)
+    configured_lanes = {x for x in (writer_lanes_init, writer_lanes_proc) if x}
+    if len(configured_lanes) > 1:
+        raise ValueError("init and proc archive writer_lanes must match")
+    writer_lanes = configured_lanes.pop() if configured_lanes else 0
+    writer_queue_depth = max(
+        configs_init['archive'].get('writer_queue_depth', 8),
+        configs_proc['archive'].get('writer_queue_depth', 8),
+    )
 
     for fname in (configs_init['archive']['policy']['filename'],
                   configs_proc['archive']['policy']['filename']
@@ -271,19 +381,30 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
         proc_temp_subdir
     )
 
-    for obs_id in obs_list:
-        pp_util.cleanup_obs(obs_id, init_policy_dir, errlog, configs_init,
-                            context_init, subdir=init_temp_subdir, remove=overwrite)
-        pp_util.cleanup_obs(obs_id, proc_policy_dir, errlog, configs_proc,
-                            context_proc, subdir=proc_temp_subdir, remove=overwrite)
+    if writer_lanes and not overwrite:
+        _recover_temp_files(
+            obs_list,
+            {"init": configs_init, "proc": configs_proc},
+            {"init": context_init, "proc": context_proc},
+            {"init": init_temp_subdir, "proc": proc_temp_subdir},
+            group_by,
+            writer_lanes,
+            writer_queue_depth,
+            jdb if jobdb_path is not None else None,
+            logger,
+        )
+    else:
+        for obs_id in obs_list:
+            pp_util.cleanup_obs(obs_id, init_policy_dir, errlog, configs_init,
+                                context_init, subdir=init_temp_subdir, remove=overwrite)
+            pp_util.cleanup_obs(obs_id, proc_policy_dir, errlog, configs_proc,
+                                context_proc, subdir=proc_temp_subdir, remove=overwrite)
 
     # remove datasets from final archive file not found in init db
     for config in (configs_init, configs_proc):
         pp_util.cleanup_archive(config, logger)
 
     run_list = []
-
-    group_by = np.atleast_1d(configs_proc['subobs'].get('use', 'detset'))
 
     if overwrite or not os.path.exists(configs_init['archive']['index']):
         init_db = None
@@ -419,16 +540,6 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
 
     batch_size_init = configs_init['archive'].get('batch_size', 1)
     batch_size_proc = configs_proc['archive'].get('batch_size', 1)
-    writer_lanes_init = configs_init['archive'].get('writer_lanes', 0)
-    writer_lanes_proc = configs_proc['archive'].get('writer_lanes', 0)
-    configured_lanes = {x for x in (writer_lanes_init, writer_lanes_proc) if x}
-    if len(configured_lanes) > 1:
-        raise ValueError("init and proc archive writer_lanes must match")
-    writer_lanes = configured_lanes.pop() if configured_lanes else 0
-    writer_queue_depth = max(
-        configs_init['archive'].get('writer_queue_depth', 8),
-        configs_proc['archive'].get('writer_queue_depth', 8),
-    )
     publication_records = []
 
     pb_name = os.path.join(pb_path or '', f"pb_{str(int(time.time()))}.txt")

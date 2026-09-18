@@ -40,6 +40,73 @@ def _update_jobdb(jdb, obs_id, group, group_by, state, error=None):
                     tag.value = error
 
 
+def _recover_temp_files(
+    obs_list,
+    configs,
+    context,
+    temp_subdir,
+    group_by,
+    writer_lanes,
+    writer_queue_depth,
+    jdb,
+    logger,
+):
+    pending = []
+    for obs_id in obs_list:
+        outputs, _ = pp_util.get_temp_group_outputs(
+            obs_id, configs, context=context, subdir=temp_subdir
+        )
+        pending.extend(outputs)
+    if not pending:
+        return
+
+    logger.info(f"Recovering {len(pending)} temporary preprocessing files")
+    db = pp_util.get_preprocess_db(configs, group_by, logger)
+    records = []
+    batch_size = configs['archive'].get('batch_size', 1)
+    with DbBatchManager(db, batch_size=batch_size, logger=logger) as db_manager:
+        publisher = ArchivePublisher(
+            configs={"init": configs},
+            db_managers={"init": db_manager},
+            lane_count=writer_lanes,
+            queue_depth=writer_queue_depth,
+        )
+        for out_dict, (obs_id, group) in pending:
+            record = {
+                'obs_id': obs_id,
+                'group': group,
+                'committed': False,
+                'error': None,
+            }
+            records.append(record)
+            publisher.submit("init", out_dict, token=record, recover=True)
+
+        def committed(record, result):
+            record['committed'] = True
+
+        def failed(record, result):
+            record['error'] = result.error
+            logger.error(
+                f"Archive recovery failed for {record['obs_id']}:"
+                f"{record['group']}: {result.error}\n{result.traceback}"
+            )
+
+        publisher.finish(committed, failed)
+    db.conn.close()
+
+    if jdb is not None:
+        for record in records:
+            _update_jobdb(
+                jdb,
+                record['obs_id'],
+                record['group'],
+                group_by,
+                JState.done if record['committed'] else JState.open,
+                error=(None if record['committed']
+                       else PreprocessErrors.ArchiveWriteError),
+            )
+
+
 def load_preprocess_tod_sim(obs_id,
                             sim_map,
                             configs="preprocess_configs.yaml",
@@ -184,6 +251,9 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
 
     configs, context = pp_util.get_preprocess_context(configs)
     logger = pp_util.init_logger("preprocess", verbosity=verbosity)
+    group_by = np.atleast_1d(configs['subobs'].get('use', 'detset'))
+    writer_lanes = configs['archive'].get('writer_lanes', 0)
+    writer_queue_depth = configs['archive'].get('writer_queue_depth', 8)
 
     os.makedirs(os.path.dirname(configs['archive']['policy']['filename']),
                 exist_ok=True)
@@ -216,21 +286,27 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
             logger.warning(f"No observations returned from query: {query}")
             return
 
-    # clean up lingering files from previous incomplete runs
+    # Clean up lingering files from previous incomplete runs. Parallel archive
+    # configurations recover through the same writer lanes used by new work.
     policy_dir = os.path.join(os.path.dirname(
             configs['archive']['policy']['filename']),
             temp_subdir
     )
-    for obs_id in obs_list:
-        pp_util.cleanup_obs(obs_id, policy_dir, errlog, configs, context,
-                            subdir=temp_subdir, remove=overwrite)
+    if writer_lanes and not overwrite:
+        _recover_temp_files(
+            obs_list, configs, context, temp_subdir, group_by,
+            writer_lanes, writer_queue_depth,
+            jdb if jobdb_path is not None else None, logger,
+        )
+    else:
+        for obs_id in obs_list:
+            pp_util.cleanup_obs(obs_id, policy_dir, errlog, configs, context,
+                                subdir=temp_subdir, remove=overwrite)
 
     # remove datasets from final archive file not found in db
     pp_util.cleanup_archive(configs, logger)
 
     run_list = []
-
-    group_by = np.atleast_1d(configs['subobs'].get('use', 'detset'))
 
     if overwrite or not os.path.exists(configs['archive']['index']):
         db = None
@@ -334,8 +410,6 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
 
     # batch updates to ManifestDb
     batch_size = configs['archive'].get('batch_size', 1)
-    writer_lanes = configs['archive'].get('writer_lanes', 0)
-    writer_queue_depth = configs['archive'].get('writer_queue_depth', 8)
     publication_records = []
 
     pb_name = os.path.join(pb_path or '', f"pb_{str(int(time.time()))}.txt")

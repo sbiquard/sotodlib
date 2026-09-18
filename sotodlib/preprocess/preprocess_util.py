@@ -1141,6 +1141,27 @@ def get_preproc_group_out_dict(obs_id, configs, dets, context=None, subdir='temp
     return outputs
 
 
+def get_temp_group_outputs(obs_id, configs, context=None, subdir='temp'):
+    """Return existing per-group temporary outputs for an observation."""
+    if type(configs) == str:
+        configs = yaml.safe_load(open(configs, "r"))
+    if context is None:
+        context = core.Context(configs["context_file"])
+
+    group_by, groups, errors = get_groups(obs_id, configs)
+    outputs = []
+    for group in groups:
+        if 'wafer.bandpass' in group_by and 'NC' in group:
+            continue
+        dets = {gb: value for gb, value in zip(group_by, group)}
+        output = get_preproc_group_out_dict(
+            obs_id, configs, dets, context=context, subdir=subdir
+        )
+        if os.path.exists(output['temp_file']):
+            outputs.append((output, (obs_id, group)))
+    return outputs, errors
+
+
 def save_group_and_cleanup(obs_id, configs, context=None, subdir='temp',
                            logger=None, remove=False):
     """This function checks if any temporary files exist from a preprocessing
@@ -1182,44 +1203,34 @@ def save_group_and_cleanup(obs_id, configs, context=None, subdir='temp',
     if context is None:
         context = core.Context(configs["context_file"])
 
-    group_by, groups, errors = get_groups(obs_id, configs)
+    outputs, errors = get_temp_group_outputs(
+        obs_id, configs, context=context, subdir=subdir
+    )
 
-    all_groups = groups.copy()
-    for g in all_groups:
-        if 'wafer.bandpass' in group_by:
-            if 'NC' in g:
-                groups.remove(g)
-                continue
-
-    for g in groups:
-        dets = {gb:gg for gb, gg in zip(group_by, g)}
-        outputs_grp = get_preproc_group_out_dict(obs_id, configs,
-                                                 dets, subdir=subdir)
-
-        if os.path.exists(outputs_grp['temp_file']):
-            try:
-                if not remove:
-                    cleanup_mandb(outputs_grp, (obs_id, g),
-                                  (None, None, None), configs, logger)
-                else:
-                    # if we're overwriting, remove file so it will re-run
-                    os.remove(outputs_grp['temp_file'])
-            except OSError as e:
-                # remove if it can't be opened
+    for outputs_grp, (_, group) in outputs:
+        try:
+            if not remove:
+                cleanup_mandb(outputs_grp, (obs_id, group),
+                              (None, None, None), configs, logger)
+            else:
+                # if we're overwriting, remove file so it will re-run
                 os.remove(outputs_grp['temp_file'])
-            except Exception as e:
-                err_str = str(e)
+        except OSError:
+            # remove if it can't be opened
+            os.remove(outputs_grp['temp_file'])
+        except Exception as e:
+            err_str = str(e)
 
-                if "destination object already exists" in err_str:
-                    # remove temp file it was copied but not deleted
-                    os.remove(outputs_grp['temp_file'])
-                else:
-                    errmsg = f"{type(e).__name__}: {e}"
-                    tb = ''.join(traceback.format_tb(e.__traceback__))
-                    logger.error(
-                        f"save_group_and_cleanup failed for {outputs_grp['temp_file']}:\n{errmsg}\n{tb}"
-                    )
-                    raise
+            if "destination object already exists" in err_str:
+                # remove temp file it was copied but not deleted
+                os.remove(outputs_grp['temp_file'])
+            else:
+                errmsg = f"{type(e).__name__}: {e}"
+                tb = ''.join(traceback.format_tb(e.__traceback__))
+                logger.error(
+                    f"save_group_and_cleanup failed for {outputs_grp['temp_file']}:\n{errmsg}\n{tb}"
+                )
+                raise
     return errors
 
 
