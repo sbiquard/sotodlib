@@ -173,6 +173,8 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
 
     configs, context = pp_util.get_preprocess_context(configs)
     logger = pp_util.init_logger("preprocess", verbosity=verbosity)
+    failure_tracker = pp_util.PreprocessFailureTracker(max_repeated_error)
+    discovery_failures = 0
 
     os.makedirs(os.path.dirname(configs['archive']['policy']['filename']),
                 exist_ok=True)
@@ -236,7 +238,28 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
         for future in tqdm(as_completed_callable(futures), total=len(futures),
                            desc="building run list from obs list"):
             obs_id = futures_dict[future]
-            _, groups, get_groups_err = future.result()
+            try:
+                _, groups, get_groups_err = future.result()
+            except Exception as e:
+                errmsg, tb = PreprocessErrors.get_errors(e)
+                groups = []
+                get_groups_err = (
+                    PreprocessErrors.ExecutorFutureError, errmsg, tb
+                )
+                failure = pp_util.PreprocessFailure.from_errors(
+                    get_groups_err, exception=e
+                )
+            else:
+                failure = pp_util.PreprocessFailure.from_errors(get_groups_err)
+
+            if failure is not None:
+                discovery_failures += 1
+                logger.error(
+                    f"Group discovery failed for {obs_id}: "
+                    f"{failure.category}: {failure.message}"
+                )
+                failure_tracker.record(obs_id, None, failure)
+                continue
 
             if db is not None and not overwrite:
                 x = db.inspect({'obs:obs_id': obs_id})
@@ -293,6 +316,12 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
 
     if len(run_list) == 0:
         logger.info("Nothing to run")
+        failure_tracker.raise_if_needed(
+            discovery_failures,
+            raise_error=raise_error,
+            max_failed_groups=max_failed_groups,
+            max_failed_fraction=max_failed_fraction,
+        )
         return
     logger.info(f'Run list created with {len(run_list)} obsid groups')
 
@@ -301,7 +330,6 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
 
     futures = []
     futures_dict = {}
-    failure_tracker = pp_util.PreprocessFailureTracker(max_repeated_error)
 
     for r in run_list:
         futures.append(
@@ -400,10 +428,11 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
                         batched_job_fields = []
                     raise
 
-    failure_summary = failure_tracker.summary(len(run_list))
+    total_work = len(run_list) + discovery_failures
+    failure_summary = failure_tracker.summary(total_work)
     logger.info(f"Preprocessing failure summary: {failure_summary}")
     failure_tracker.raise_if_needed(
-        len(run_list),
+        total_work,
         raise_error=raise_error,
         max_failed_groups=max_failed_groups,
         max_failed_fraction=max_failed_fraction,
