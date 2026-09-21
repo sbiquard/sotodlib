@@ -47,7 +47,7 @@ import sys
 import json
 import argparse
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from . import common, resultset
 
@@ -831,9 +831,13 @@ class DbBatchManager:
         logger : logging.Logger, optional
             Logger object. If None, uses a basic logger.
         """
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) \
+                or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
         self.db = db
         self.batch_size = batch_size
         self.batch_counter = 0
+        self._post_commit = []
 
         if logger is None:
             self.logger = logging.getLogger('DbBatchManager')
@@ -845,8 +849,11 @@ class DbBatchManager:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        """Context manager exit - commit any remaining operations."""
-        self.force_commit()
+        """Commit successful work, or roll back the pending batch."""
+        if exc_type is None:
+            self.force_commit()
+        else:
+            self.rollback()
         return False
 
     def add_entry(
@@ -855,6 +862,7 @@ class DbBatchManager:
         filename: str | None = None,
         create: bool = True,
         replace: bool = False,
+        on_commit: Callable[[], None] | None = None,
     ) -> None:
         """Add an entry to the database, committing only when batch size is reached.
 
@@ -868,6 +876,10 @@ class DbBatchManager:
             If False, do not create new entry in the file table.
         replace : bool
             If True, replace existing entry if it exists.
+        on_commit : callable, optional
+            Callback invoked only after the entry is durably committed. If the
+            entry already exists, the callback is invoked immediately unless
+            another batch is pending on this connection.
         """
         # Check if entry already exists to avoid duplicates
         existing_entries = self.db.inspect(params)
@@ -877,21 +889,51 @@ class DbBatchManager:
                 params, filename=filename, create=create, commit=False, replace=replace
             )
             self.batch_counter += 1
+            if on_commit is not None:
+                self._post_commit.append(on_commit)
 
             # Commit if we've reached the batch size
             if self.batch_counter >= self.batch_size:
                 self.logger.info(f'Committing batch of {self.batch_counter} operations')
-                self.db.conn.commit()
-                self.batch_counter = 0
+                self._commit()
         else:
             self.logger.debug(f'Entry already exists for {params}, skipping')
+            if on_commit is not None:
+                if self.batch_counter:
+                    self._post_commit.append(on_commit)
+                else:
+                    on_commit()
+
+    def _commit(self) -> None:
+        """Commit the current batch, then run its durability callbacks."""
+        self.db.conn.commit()
+        callbacks = self._post_commit
+        self.batch_counter = 0
+        self._post_commit = []
+
+        failures = []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception as e:
+                failures.append(e)
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} post-commit callback(s) failed"
+            ) from failures[0]
 
     def force_commit(self) -> None:
         """Force a commit of any pending operations."""
         if self.batch_counter > 0:
             self.logger.info(f'Forced commit of {self.batch_counter} batched operations')
-            self.db.conn.commit()
+            self._commit()
+
+    def rollback(self) -> None:
+        """Roll back pending operations and discard their callbacks."""
+        if self.batch_counter > 0:
+            self.db.conn.rollback()
             self.batch_counter = 0
+            self._post_commit = []
 
 
 class MultiDbBatchManager:
@@ -969,8 +1011,12 @@ class MultiDbBatchManager:
         return tuple(self.managers)
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        """Context manager exit - commit all pending operations."""
-        self.force_commit_all()
+        """Commit successful work, or roll back all pending batches."""
+        if exc_type is None:
+            self.force_commit_all()
+        else:
+            for manager in self.managers:
+                manager.rollback()
         return False
 
     def force_commit_all(self) -> None:

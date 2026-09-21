@@ -1396,10 +1396,9 @@ def save_group_and_cleanup(obs_id, configs, context=None, subdir='temp',
                            logger=None, remove=False):
     """This function checks if any temporary files exist from a preprocessing
      run and will either add them to the config policy file and create an entry
-     in the manifest db by calling ``cleanup_mandb``.  If the file exists but
-     cannot be opened or if remove is True, the file will be deleted. Remove
-     is intended to be to allow for overwrite=True in ``preprocess_tod.py``
-     and ``multilayer_preprocess_tod.py``.
+     in the manifest db by calling ``cleanup_mandb``. A failed recovery leaves
+     the temporary file in place for a later retry. If ``remove`` is True, the
+     file is deleted to support overwrite mode in the preprocessing drivers.
 
     Arguments
     ----------
@@ -1455,22 +1454,13 @@ def save_group_and_cleanup(obs_id, configs, context=None, subdir='temp',
                 else:
                     # if we're overwriting, remove file so it will re-run
                     os.remove(outputs_grp['temp_file'])
-            except OSError as e:
-                # remove if it can't be opened
-                os.remove(outputs_grp['temp_file'])
             except Exception as e:
-                err_str = str(e)
-
-                if "destination object already exists" in err_str:
-                    # remove temp file it was copied but not deleted
-                    os.remove(outputs_grp['temp_file'])
-                else:
-                    errmsg = f"{type(e).__name__}: {e}"
-                    tb = ''.join(traceback.format_tb(e.__traceback__))
-                    logger.error(
-                        f"save_group_and_cleanup failed for {outputs_grp['temp_file']}:\n{errmsg}\n{tb}"
-                    )
-                    raise
+                errmsg = f"{type(e).__name__}: {e}"
+                tb = ''.join(traceback.format_tb(e.__traceback__))
+                logger.error(
+                    f"save_group_and_cleanup failed for {outputs_grp['temp_file']}:\n{errmsg}\n{tb}"
+                )
+                raise
     return errors
 
 
@@ -1902,26 +1892,36 @@ def cleanup_mandb(out_dict, out_meta, errors, configs, logger=None, overwrite=Fa
         with H5ContextManager(dest_file, mode='a') as f_dest:
             with H5ContextManager(src_file, mode='r') as f_src:
                 for dts in f_src.keys():
-                    # If the dataset or group already exists, delete it to overwrite
-                    if overwrite and dts in f_dest:
-                        del f_dest[dts]
-                    f_src.copy(f_src[f'{dts}'], f_dest, f'{dts}')
-                    for member in f_src[dts]:
-                        if isinstance(f_src[f'{dts}/{member}'], h5py.Dataset):
-                            f_src.copy(f_src[f'{dts}/{member}'], f_dest[f'{dts}'], f'{dts}/{member}')
+                    staging = f".__sotodlib_staging__.{dts}"
+                    if staging in f_dest:
+                        del f_dest[staging]
+                    if dts not in f_dest or overwrite:
+                        f_src.copy(f_src[dts], f_dest, staging)
+                        if dts in f_dest:
+                            del f_dest[dts]
+                        f_dest.move(staging, dts)
+
+        def remove_temp_file():
+            try:
+                os.remove(src_file)
+            except FileNotFoundError:
+                pass
 
         if db_manager is not None:
-            # Use the batch manager
-            db_manager.add_entry(out_dict['db_data'], h5_path)
+            # Keep the temporary file until its manifest entry is committed.
+            db_manager.add_entry(
+                out_dict['db_data'], h5_path, on_commit=remove_temp_file
+            )
         else:
             # Use the original approach for backward compatibility
             db = get_preprocess_db(configs, group_by, logger)
-            if len(db.inspect(out_dict['db_data'])) == 0:
-                db.add_entry(out_dict['db_data'], h5_path)
-            # make sure we close the db each time
-            db.conn.close()
-
-        os.remove(src_file)
+            try:
+                if len(db.inspect(out_dict['db_data'])) == 0:
+                    db.add_entry(out_dict['db_data'], h5_path)
+                remove_temp_file()
+            finally:
+                # make sure we close the db each time
+                db.conn.close()
     elif (
         errors[0] == PreprocessErrors.LoadSuccess or
         (errors[0] is None and out_dict is None)

@@ -52,6 +52,15 @@ class TestDbBatchManager(unittest.TestCase):
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
 
+    def test_batch_size_must_be_positive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scheme = ManifestScheme()
+            scheme.add_exact_match('obs:obs_id')
+            db = ManifestDb(os.path.join(temp_dir, 'test.db'), scheme=scheme)
+            with self.assertRaises(ValueError):
+                DbBatchManager(db, batch_size=0)
+            db.conn.close()
+
     def test_batch_manager_add_entry(self):
         """Test adding entries with the batch manager."""
 
@@ -94,6 +103,52 @@ class TestDbBatchManager(unittest.TestCase):
             # Clean up
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
+
+    def test_post_commit_callbacks_follow_transaction(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, 'test.db')
+            scheme = ManifestScheme()
+            scheme.add_exact_match('obs:obs_id')
+            scheme.add_data_field('dataset')
+            db = ManifestDb(db_path, scheme=scheme)
+            callbacks = []
+
+            with DbBatchManager(db, batch_size=2) as manager:
+                manager.add_entry(
+                    {'obs:obs_id': 'one', 'dataset': 'one'},
+                    'one.h5', on_commit=lambda: callbacks.append('one'),
+                )
+                self.assertEqual(callbacks, [])
+                manager.add_entry(
+                    {'obs:obs_id': 'two', 'dataset': 'two'},
+                    'two.h5', on_commit=lambda: callbacks.append('two'),
+                )
+                self.assertEqual(callbacks, ['one', 'two'])
+
+            db.conn.close()
+
+    def test_exception_rolls_back_pending_batch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, 'test.db')
+            scheme = ManifestScheme()
+            scheme.add_exact_match('obs:obs_id')
+            scheme.add_data_field('dataset')
+            db = ManifestDb(db_path, scheme=scheme)
+            callbacks = []
+
+            with self.assertRaisesRegex(RuntimeError, 'stop'):
+                with DbBatchManager(db, batch_size=10) as manager:
+                    manager.add_entry(
+                        {'obs:obs_id': 'one', 'dataset': 'one'},
+                        'one.h5', on_commit=lambda: callbacks.append('one'),
+                    )
+                    raise RuntimeError('stop')
+
+            self.assertEqual(callbacks, [])
+            db.conn.close()
+            reopened = ManifestDb(db_path)
+            self.assertEqual(len(reopened.inspect({})), 0)
+            reopened.conn.close()
 
 
 class TestMultiDbBatchManager(unittest.TestCase):
