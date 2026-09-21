@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Tuple, Union, List, Callable, Optional
 
 
-def _get_mpi_comm() -> (
+def _get_mpi_comm(comm=None) -> (
     Tuple[bool, int, Optional["MPICommExecutor"], Optional[Callable]]
 ):
     """This private function tries to create an MPICommExecutor object and returns it if successful.
@@ -23,7 +23,8 @@ def _get_mpi_comm() -> (
         from mpi4py.futures import as_completed
         from mpi4py import MPI
 
-        comm = MPI.COMM_WORLD
+        if comm is None:
+            comm = MPI.COMM_WORLD
 
         rank = comm.Get_rank()
         max_workers = comm.Get_size() - 1
@@ -64,7 +65,9 @@ def _get_concurrent_comm(
 
 
 def get_exec_env(
-    nprocs: int = None, priority: List[str] = ["mpi", "process_pool"]
+    nprocs: int = None,
+    priority: List[str] = ["mpi", "process_pool"],
+    mpi_comm=None,
 ) -> Tuple[int, Union["MPICommExecutor", "ProcessPoolExecutor"], Callable]:
     """This function sets up the execution environment for parallel processing based on the specified priority list.
 
@@ -107,6 +110,10 @@ def get_exec_env(
     nprocs : int, optional
         The number of processes to use for the process pool executor. If not specified, the default is None.
     priority : List[str], optional
+    mpi_comm : mpi4py.MPI.Comm, optional
+        Communicator used by ``MPICommExecutor``. Defaults to
+        ``MPI.COMM_WORLD``. This permits callers to reserve world ranks for
+        services outside the compute executor.
 
     Returns
     -------
@@ -130,7 +137,7 @@ def get_exec_env(
         executor_mode = user_priority.pop(0)
         if executor_mode == "mpi":
             executor_created, rank, executor, as_completed_callable = (
-                _get_mpi_comm()
+                _get_mpi_comm(comm=mpi_comm)
             )
         elif executor_mode == "process_pool":
             executor_created, rank, executor, as_completed_callable = (

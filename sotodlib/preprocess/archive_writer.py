@@ -16,11 +16,20 @@ import re
 import time
 import traceback
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
 import h5py
+
+
+_MPI_REQUEST = 27001
+_MPI_RESULT = 27002
+_MPI_SESSION_CLOSE = 27003
+_MPI_SESSION_CLOSED = 27004
+_MPI_STOP = 27005
+_MPI_STOPPED = 27006
 
 
 @dataclass(frozen=True)
@@ -274,6 +283,118 @@ def _writer_main(lane, request_queue, result_queue):
         state.close()
 
 
+def run_mpi_archive_writer_service(comm, lane, root=0):
+    """Serve archive requests on a rank reserved from the compute pool."""
+    from mpi4py import MPI
+
+    state = _LaneState(lane)
+    try:
+        while True:
+            status = MPI.Status()
+            request = comm.recv(
+                source=root,
+                tag=MPI.ANY_TAG,
+                status=status,
+            )
+            tag = status.Get_tag()
+            if tag == _MPI_REQUEST:
+                try:
+                    result = state.publish(request)
+                except Exception as error:
+                    result = ArchiveResult(
+                        request_id=request.request_id,
+                        archive_name=request.archive_name,
+                        temp_file=request.temp_file,
+                        db_data=request.db_data,
+                        h5_path=None,
+                        lane=lane,
+                        archive_file=None,
+                        elapsed=0,
+                        error=f"{type(error).__name__}: {error}",
+                        traceback=traceback.format_exc(),
+                    )
+                comm.send(result, dest=root, tag=_MPI_RESULT)
+            elif tag == _MPI_SESSION_CLOSE:
+                state.close()
+                state = _LaneState(lane)
+                comm.send(lane, dest=root, tag=_MPI_SESSION_CLOSED)
+            elif tag == _MPI_STOP:
+                break
+            else:
+                raise RuntimeError(
+                    f"Archive writer lane {lane} received unknown MPI tag "
+                    f"{tag}"
+                )
+    finally:
+        state.close()
+    comm.send(lane, dest=root, tag=_MPI_STOPPED)
+
+
+def split_mpi_archive_writer_ranks(lane_count):
+    """Reserve the final MPI ranks as archive writer services.
+
+    This collective must be called by every rank in ``MPI.COMM_WORLD`` before
+    the compute executor is constructed.  Writer ranks serve until rank zero
+    calls :func:`stop_mpi_archive_writer_ranks` and then return ``is_writer``
+    as true.  Compute ranks receive a communicator excluding the writers.
+    """
+    if not lane_count:
+        return None, None, False
+
+    try:
+        from mpi4py import MPI
+    except ImportError:
+        return None, None, False
+
+    world = MPI.COMM_WORLD
+    if world.size == 1:
+        return None, None, False
+    if lane_count >= world.size - 1:
+        raise ValueError(
+            f"writer_lanes={lane_count} leaves fewer than one compute worker "
+            f"in an MPI world of size {world.size}"
+        )
+
+    first_writer = world.size - lane_count
+    writer_ranks = list(range(first_writer, world.size))
+    is_writer = world.rank >= first_writer
+    compute_comm = world.Split(
+        MPI.UNDEFINED if is_writer else 0,
+        key=world.rank,
+    )
+    if is_writer:
+        run_mpi_archive_writer_service(
+            world,
+            lane=world.rank - first_writer,
+        )
+        return None, None, True
+    return compute_comm, (world, writer_ranks), False
+
+
+def stop_mpi_archive_writer_ranks(comm, writer_ranks):
+    """Stop persistent writer services and drain any outstanding replies."""
+    from mpi4py import MPI
+
+    for rank in writer_ranks:
+        comm.send(None, dest=rank, tag=_MPI_STOP)
+
+    stopped = set()
+    while len(stopped) < len(writer_ranks):
+        status = MPI.Status()
+        comm.recv(
+            source=MPI.ANY_SOURCE,
+            tag=MPI.ANY_TAG,
+            status=status,
+        )
+        tag = status.Get_tag()
+        if tag == _MPI_STOPPED:
+            stopped.add(status.Get_source())
+        elif tag not in (_MPI_RESULT, _MPI_SESSION_CLOSED):
+            raise RuntimeError(
+                f"Unexpected MPI tag {tag} while stopping archive writers"
+            )
+
+
 class ArchiveWriterPool:
     """A process pool with exactly one writer for each archive lane."""
 
@@ -387,6 +508,123 @@ class ArchiveWriterPool:
         return False
 
 
+class MPIArchiveWriterPool:
+    """Archive writer pool backed by ranks reserved from ``COMM_WORLD``."""
+
+    def __init__(self, comm, writer_ranks, queue_depth=8):
+        if not writer_ranks:
+            raise ValueError("At least one MPI archive writer rank is required")
+        if queue_depth < 1:
+            raise ValueError("queue_depth must be at least one")
+        self.comm = comm
+        self.writer_ranks = list(writer_ranks)
+        self.lane_count = len(self.writer_ranks)
+        self.queue_depth = queue_depth
+        self._pending = set()
+        self._pending_by_lane = [0] * self.lane_count
+        self._ready = deque()
+        self._closed = False
+        self._joined = False
+
+    @property
+    def pending(self):
+        return len(self._pending)
+
+    def _receive_mpi_result(self, block=True, timeout=None):
+        from mpi4py import MPI
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.comm.iprobe(source=MPI.ANY_SOURCE, tag=_MPI_RESULT):
+            if not block:
+                raise queue.Empty
+            if deadline is not None and time.monotonic() >= deadline:
+                raise queue.Empty
+            time.sleep(0.01)
+
+        result = self.comm.recv(source=MPI.ANY_SOURCE, tag=_MPI_RESULT)
+        if result.request_id not in self._pending:
+            raise RuntimeError(
+                f"Unexpected archive result {result.request_id} from MPI lane "
+                f"{result.lane}"
+            )
+        self._pending.remove(result.request_id)
+        self._pending_by_lane[result.lane] -= 1
+        return result
+
+    def _receive_result(self, block=True, timeout=None):
+        if self._ready:
+            return self._ready.popleft()
+        return self._receive_mpi_result(block=block, timeout=timeout)
+
+    def submit(self, request: ArchiveRequest):
+        if self._closed:
+            raise RuntimeError("MPIArchiveWriterPool is closed")
+        if request.request_id in self._pending:
+            raise ValueError(f"Duplicate request id {request.request_id}")
+        lane = lane_for_dataset(request.db_data["dataset"], self.lane_count)
+        while self._pending_by_lane[lane] >= self.queue_depth:
+            self._ready.append(self._receive_mpi_result())
+        self.comm.send(
+            request,
+            dest=self.writer_ranks[lane],
+            tag=_MPI_REQUEST,
+        )
+        self._pending.add(request.request_id)
+        self._pending_by_lane[lane] += 1
+        return request.request_id
+
+    def get_result(self, block=True, timeout=None):
+        return self._receive_result(block=block, timeout=timeout)
+
+    def get_available(self):
+        results = []
+        while True:
+            try:
+                results.append(self.get_result(block=False))
+            except queue.Empty:
+                return results
+
+    def iter_results(self):
+        while self._ready or self._pending:
+            yield self.get_result()
+
+    def check_health(self):
+        return None
+
+    def close_submissions(self):
+        if self._closed:
+            return
+        self._closed = True
+        for rank in self.writer_ranks:
+            self.comm.send(None, dest=rank, tag=_MPI_SESSION_CLOSE)
+
+    def join(self):
+        if self._joined:
+            return
+        self.close_submissions()
+        for rank in self.writer_ranks:
+            self.comm.recv(source=rank, tag=_MPI_SESSION_CLOSED)
+        self._joined = True
+
+    def terminate(self):
+        self.close_submissions()
+        for _ in self.iter_results():
+            pass
+        self.join()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        if exc_type is None:
+            for _ in self.iter_results():
+                pass
+            self.join()
+        else:
+            self.terminate()
+        return False
+
+
 class ArchivePublisher:
     """Connect archive writer results to rank-zero manifest managers."""
 
@@ -397,14 +635,28 @@ class ArchivePublisher:
         lane_count=4,
         queue_depth=8,
         overwrite=False,
+        mpi_comm=None,
+        writer_ranks=None,
     ):
         self.configs = configs
         self.db_managers = db_managers
         self.overwrite = overwrite
-        self.writers = ArchiveWriterPool(
-            lane_count=lane_count,
-            queue_depth=queue_depth,
-        )
+        if mpi_comm is None:
+            self.writers = ArchiveWriterPool(
+                lane_count=lane_count,
+                queue_depth=queue_depth,
+            )
+        else:
+            if len(writer_ranks) != lane_count:
+                raise ValueError(
+                    f"Received {len(writer_ranks)} MPI writer ranks for "
+                    f"{lane_count} archive lanes"
+                )
+            self.writers = MPIArchiveWriterPool(
+                comm=mpi_comm,
+                writer_ranks=writer_ranks,
+                queue_depth=queue_depth,
+            )
         self._tokens = {}
 
     def submit(self, archive_name, out_dict, token, recover=False):
@@ -429,7 +681,6 @@ class ArchivePublisher:
 
     def finish(self, on_commit, on_error):
         """Drain writers and stage successful results in manifest batches."""
-        self.writers.close_submissions()
         try:
             for result in self.writers.iter_results():
                 token = self._tokens.pop(result.request_id)

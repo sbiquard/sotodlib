@@ -1,6 +1,10 @@
 import os
+import sys
 import tempfile
+import types
 import unittest
+from collections import deque
+from unittest import mock
 
 import h5py
 import numpy as np
@@ -8,7 +12,13 @@ import numpy as np
 from sotodlib.preprocess.archive_writer import (
     ArchivePublisher,
     ArchiveRequest,
+    ArchiveResult,
     ArchiveWriterPool,
+    MPIArchiveWriterPool,
+    _MPI_REQUEST,
+    _MPI_RESULT,
+    _MPI_SESSION_CLOSE,
+    _MPI_SESSION_CLOSED,
     lane_for_dataset,
     publish_archive_request,
 )
@@ -97,6 +107,61 @@ class TestArchiveWriter(unittest.TestCase):
         self.assertNotEqual(first_result.archive_file, second_result.archive_file)
         self.assertTrue(first_result.archive_file.endswith("_000.h5"))
         self.assertTrue(second_result.archive_file.endswith("_001.h5"))
+
+    def test_mpi_writer_pool_applies_lane_backpressure(self):
+        class FakeComm:
+            def __init__(self):
+                self.results = deque()
+                self.closed = set()
+
+            def send(self, message, dest, tag):
+                if tag == _MPI_REQUEST:
+                    self.results.append(
+                        ArchiveResult(
+                            request_id=message.request_id,
+                            archive_name=message.archive_name,
+                            temp_file=message.temp_file,
+                            db_data=message.db_data,
+                            h5_path="archive_lane00_000.h5",
+                            lane=0,
+                            archive_file="archive_lane00_000.h5",
+                            elapsed=0.1,
+                        )
+                    )
+                elif tag == _MPI_SESSION_CLOSE:
+                    self.closed.add(dest)
+
+            def iprobe(self, source, tag):
+                return tag == _MPI_RESULT and bool(self.results)
+
+            def recv(self, source, tag):
+                if tag == _MPI_RESULT:
+                    return self.results.popleft()
+                if tag == _MPI_SESSION_CLOSED and source in self.closed:
+                    return 0
+                raise AssertionError((source, tag))
+
+        fake_mpi4py = types.SimpleNamespace(
+            MPI=types.SimpleNamespace(ANY_SOURCE=-1)
+        )
+        requests = [self.make_request(f"mpi{i}", i) for i in range(3)]
+        comm = FakeComm()
+        with mock.patch.dict(sys.modules, {"mpi4py": fake_mpi4py}):
+            writers = MPIArchiveWriterPool(
+                comm=comm,
+                writer_ranks=[5],
+                queue_depth=1,
+            )
+            for request in requests:
+                writers.submit(request)
+            results = list(writers.iter_results())
+            writers.join()
+
+        self.assertEqual(
+            {result.request_id for result in results},
+            {request.request_id for request in requests},
+        )
+        self.assertEqual(comm.closed, {5})
 
     def test_publisher_removes_temp_only_after_manifest_commit(self):
         scheme = ManifestScheme()
