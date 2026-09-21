@@ -497,14 +497,15 @@ def write_demod_maps(prefix, data, info, unit='K', split_labels=['full']):
             data.signal.write(prefix, "%s_hits"%split_labels[n_split],
                               data.signal.hits[n_split], unit='hits')
 
-def make_demod_map(context, obslist, noise_model, info,
-                    preprocess_config, prefix, shape=None, wcs=None,
-                    nside=None, comm=mpi.COMM_WORLD, comps="TQU", t0=0,
-                    dtype_tod=np.float32, dtype_map=np.float32,
-                    tag="", verbose=0, split_labels=['full'], L=None,
-                    site='so_sat3', recenter=None, singlestream=False,
-                    unit='K', use_psd=True, wn_label='preprocess.noiseQ_mapmaking.psd',
-                    apply_wobble=True, compress=True):
+def make_demod_map_result(context, obslist, noise_model, info,
+                          preprocess_config, prefix, shape=None, wcs=None,
+                          nside=None, comm=mpi.COMM_WORLD, comps="TQU", t0=0,
+                          dtype_tod=np.float32, dtype_map=np.float32,
+                          tag="", verbose=0, split_labels=['full'], L=None,
+                          site='so_sat3', recenter=None, singlestream=False,
+                          unit='K', use_psd=True,
+                          wn_label='preprocess.noiseQ_mapmaking.psd',
+                          apply_wobble=True, compress=True):
     """
     Make a demodulated map from the list of observations in obslist.
 
@@ -571,8 +572,8 @@ def make_demod_map(context, obslist, noise_model, info,
 
     Returns
     -------
-    errors : list
-        List of errors from preprocess database. To be used in cleanup_mandb.
+    outcomes : list
+        Structured preprocessing outcomes. To be used in cleanup_mandb.
     outputs : list
         List of outputs from preprocess database. To be used in cleanup_mandb.
     info: list
@@ -593,7 +594,7 @@ def make_demod_map(context, obslist, noise_model, info,
     if comm.rank == 0: L.info(pre + "Building RHS")
     # And feed it with our observations
     nobs_kept  = 0
-    errors = [] ; outputs = []; # PENDING: do an allreduce of these.
+    outcomes = [] ; outputs = []; # PENDING: do an allreduce of these.
                                 # not needed for atomic maps, but needed for
                                 # depth-1 maps
     if len(preprocess_config)==1:
@@ -606,15 +607,19 @@ def make_demod_map(context, obslist, noise_model, info,
     for oi in range(len(obslist)):
         obs_id, detset, band = obslist[oi][:3]
         name = "%s:%s:%s" % (obs_id, detset, band)
-        obs, output_init, output_proc, error = preprocess_util.preproc_or_load_group(obs_id,
-                                                configs_init=preproc_init,
-                                                configs_proc=preproc_proc,
-                                                dets={'wafer_slot':detset, 'wafer.bandpass':band},
-                                                logger=L,
-                                                overwrite=False,
-                                                compress=compress)
-        errors.append(error[0]) ; outputs.append((output_init, output_proc)) ;
-        if error[0] not in [None,'load_success']:
+        result = preprocess_util.preproc_or_load_group_result(
+            obs_id,
+            configs_init=preproc_init,
+            configs_proc=preproc_proc,
+            dets={'wafer_slot': detset, 'wafer.bandpass': band},
+            logger=L,
+            overwrite=False,
+            compress=compress,
+        )
+        obs = result.aman
+        outcomes.append(result.outcome)
+        outputs.append((result.init_output, result.proc_output))
+        if not result.outcome.ok:
             L.info('tod %s:%s:%s failed in the preproc database'%(obs_id,detset,band))
             continue
         obs.wrap("weather", np.full(1, "toco"))
@@ -639,7 +644,7 @@ def make_demod_map(context, obslist, noise_model, info,
                         subinfo[info_entry] = info_aman[info_entry]
     # if we skip all the obs then we return error and output
     if nobs_kept == 0:
-        return errors, outputs, None
+        return outcomes, outputs, None
 
     for signal in mapmaker.signals:
         signal.prepare()
@@ -657,7 +662,14 @@ def make_demod_map(context, obslist, noise_model, info,
 
     # output to files
     write_demod_maps(prefix, mapdata, info, split_labels=split_labels, unit=unit)
-    return errors, outputs , info
+    return outcomes, outputs, info
+
+
+def make_demod_map(*args, **kwargs):
+    """Compatibility wrapper returning historical error-category strings."""
+    outcomes, outputs, info = make_demod_map_result(*args, **kwargs)
+    errors = [outcome.as_legacy_errors()[0] for outcome in outcomes]
+    return errors, outputs, info
 
 def add_weights_to_info(info, weights, split_labels):
     Nsplits = len(split_labels)

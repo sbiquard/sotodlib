@@ -474,7 +474,7 @@ def main(
             run_list.append([obslist, None, None, info_list, prefix, t, tag])
 
     futures = [executor.submit(
-            mapmaking.make_demod_map, args.context, r[0],
+            mapmaking.make_demod_map_result, args.context, r[0],
             noise_model, r[3], preprocess_config, r[4],
             shape=r[1], wcs=r[2], nside=args.nside,
             comm=FakeCommunicator(), t0=r[5], tag=r[6],
@@ -493,7 +493,7 @@ def main(
     for future in as_completed_callable(futures):
         L.info('New future as_completed result')
         try:
-            errors, outputs, d_ = future.result()
+            outcomes, outputs, d_ = future.result()
             if d_ is not None:
                 list_infos = []
                 for n_split in range(len(split_labels)):
@@ -508,7 +508,7 @@ def main(
                 if outputs[ii][idx_prepoc] is not None:
                     oid = outputs[ii][idx_prepoc]['db_data']['obs:obs_id']
                     group = [v for k, v in outputs[ii][idx_prepoc]['db_data'].items() if 'dets' in k]
-                    preprocess_util.cleanup_mandb(outputs[ii][idx_prepoc], (oid, group), (errors[ii], None, None),
+                    preprocess_util.cleanup_mandb(outputs[ii][idx_prepoc], (oid, group), outcomes[ii],
                           preprocess_config[idx_prepoc], L)
     L.info("Done")
     return True

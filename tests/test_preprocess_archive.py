@@ -64,7 +64,7 @@ class TestPreprocessArchivePublication(unittest.TestCase):
                     },
                 },
                 ("obs", ["ds"]),
-                (None, None, None),
+                pp_util.PreprocessOutcome.computed(),
                 configs,
             )
 
@@ -116,7 +116,7 @@ class TestPreprocessArchivePublication(unittest.TestCase):
                             },
                         },
                         (f"obs-{index}", ["ds"]),
-                        (None, None, None),
+                        pp_util.PreprocessOutcome.computed(),
                         configs,
                         db_manager=manager,
                     )
@@ -160,7 +160,7 @@ class TestPreprocessArchivePublication(unittest.TestCase):
                     },
                 },
                 ("obs", ["ds"]),
-                (None, None, None),
+                pp_util.PreprocessOutcome.computed(),
                 configs,
             )
 

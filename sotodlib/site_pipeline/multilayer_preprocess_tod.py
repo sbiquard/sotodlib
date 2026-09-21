@@ -26,13 +26,13 @@ from sotodlib.site_pipeline.utils.obsdb import get_obslist
 logger = pp_util.init_logger("preprocess")
 
 
-def multilayer_preprocess_tod(obs_id: str,
-                              configs_init: Union[str, dict],
-                              configs_proc: Union[str, dict],
-                              group: list,
-                              verbosity: int = 0,
-                              compress: bool = False,
-                              overwrite: bool = False):
+def multilayer_preprocess_tod_result(obs_id: str,
+                                     configs_init: Union[str, dict],
+                                     configs_proc: Union[str, dict],
+                                     group: list,
+                                     verbosity: int = 0,
+                                     compress: bool = False,
+                                     overwrite: bool = False):
     """Meant to be run as part of a batched script, this function calls the
     preprocessing pipeline a specific Observation ID and group combination
     and saves the results in the ManifestDb specified in the configs.
@@ -67,18 +67,14 @@ def multilayer_preprocess_tod(obs_id: str,
         if preprocessing ran successfully for proc layer or ``None`` if
         preprocessing was loaded, that layer was not run or loaded, or
         ``preproc_or_load_group`` failed.
-    errors : tuple
-        A tuple containing the error from PreprocessError, an error message,
-        and the traceback. Each will be None if preproc_or_load_group finished
-        successfully.
+    outcome : PreprocessOutcome
+        Structured preprocessing outcome.
     """
     logger = pp_util.init_logger("preprocess", verbosity=verbosity)
-    failure_tracker = pp_util.PreprocessFailureTracker(max_repeated_error)
-    discovery_failures = 0
 
     group_by = np.atleast_1d(configs_proc['subobs'].get('use', 'detset'))
     dets = {gb:gg for gb, gg in zip(group_by, group)}
-    aman, out_dict_init, out_dict_proc, errors = pp_util.preproc_or_load_group(
+    result = pp_util.preproc_or_load_group_result(
         obs_id=obs_id,
         configs_init=configs_init,
         dets=dets,
@@ -89,7 +85,15 @@ def multilayer_preprocess_tod(obs_id: str,
         compress=compress,
     )
 
-    return out_dict_init, out_dict_proc, errors
+    return result.init_output, result.proc_output, result.outcome
+
+
+def multilayer_preprocess_tod(*args, **kwargs):
+    """Compatibility wrapper returning the historical error tuple."""
+    out_init, out_proc, outcome = multilayer_preprocess_tod_result(
+        *args, **kwargs
+    )
+    return out_init, out_proc, outcome.as_legacy_errors()
 
 
 def _check_init_jobdb(
@@ -207,6 +211,8 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
     configs_proc, context_proc = pp_util.get_preprocess_context(configs_proc)
 
     logger = pp_util.init_logger("preprocess", verbosity=verbosity)
+    failure_tracker = pp_util.PreprocessFailureTracker(max_repeated_error)
+    discovery_failures = 0
 
     for fname in (configs_init['archive']['policy']['filename'],
                   configs_proc['archive']['policy']['filename']
@@ -289,25 +295,26 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
         futures = []
         futures_dict = {}
         for obs_id in obs_list:
-            futures.append(executor.submit(pp_util.get_groups, obs_id, configs_proc))
+            futures.append(
+                executor.submit(
+                    pp_util.get_groups_result, obs_id, configs_proc
+                )
+            )
             futures_dict[futures[-1]] = obs_id
 
         for future in tqdm(as_completed_callable(futures), total=len(futures),
                            desc="building run list from obs list"):
             obs_id = futures_dict[future]
             try:
-                _, groups, get_groups_err = future.result()
+                group_result = future.result()
             except Exception as e:
-                errmsg, tb = PreprocessErrors.get_errors(e)
                 groups = []
-                get_groups_err = (
-                    PreprocessErrors.ExecutorFutureError, errmsg, tb
-                )
-                failure = pp_util.PreprocessFailure.from_errors(
-                    get_groups_err, exception=e
+                failure = pp_util.PreprocessFailure.from_exception(
+                    PreprocessErrors.ExecutorFutureError, e
                 )
             else:
-                failure = pp_util.PreprocessFailure.from_errors(get_groups_err)
+                groups = group_result.groups
+                failure = group_result.outcome.failure
 
             if failure is not None:
                 discovery_failures += 1
@@ -418,7 +425,7 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
 
     for r in run_list:
         futures.append(
-            executor.submit(multilayer_preprocess_tod,
+            executor.submit(multilayer_preprocess_tod_result,
                 obs_id=r[0],
                 configs_init=configs_init,
                 configs_proc=configs_proc,
@@ -464,20 +471,21 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
                                 miniters=max(1, total // 100)):
                 obs_id, group = futures_dict[future]
                 out_meta = (obs_id, group)
-                result_exception = None
                 try:
-                    out_dict_init, out_dict_proc, errors = future.result()
+                    out_dict_init, out_dict_proc, outcome = future.result()
                 except Exception as e:
-                    result_exception = e
-                    errmsg, tb = PreprocessErrors.get_errors(e)
-                    logger.error(f"Executor Future Result Error for {obs_id}: {group}:\n{errmsg}\n{tb}")
+                    failure = pp_util.PreprocessFailure.from_exception(
+                        PreprocessErrors.ExecutorFutureError, e
+                    )
+                    logger.error(
+                        f"Executor Future Result Error for {obs_id}: {group}:\n"
+                        f"{failure.message}\n{failure.traceback}"
+                    )
                     out_dict_init = None
                     out_dict_proc = None
-                    errors = (PreprocessErrors.ExecutorFutureError, errmsg, tb)
+                    outcome = pp_util.PreprocessOutcome.failed(failure)
 
-                failure = pp_util.PreprocessFailure.from_errors(
-                    errors, exception=result_exception
-                )
+                failure = outcome.failure
                 if failure is None:
                     logger.info(f"{obs_id}: {group} completed successfully")
                 else:
@@ -491,11 +499,11 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
                 # only run if first layer was run
                 if out_dict_init is not None:
                     logger.info(f"Adding future result to init db for {obs_id}: {group}")
-                    pp_util.cleanup_mandb(out_dict_init, out_meta, errors,
+                    pp_util.cleanup_mandb(out_dict_init, out_meta, outcome,
                                         configs_init, logger, overwrite,
                                         db_manager=db_mgr_init)
                 logger.info(f"Adding future result to proc db for {obs_id}: {group}")
-                pp_util.cleanup_mandb(out_dict_proc, out_meta, errors,
+                pp_util.cleanup_mandb(out_dict_proc, out_meta, outcome,
                                     configs_proc, logger, overwrite,
                                     db_manager=db_mgr_proc)
 

@@ -33,7 +33,16 @@ def plot_preprocess_tod(obs_id, configs, context, group_list=None, verbosity=2):
     """
     logger = init_logger("preprocess", verbosity=verbosity)
 
-    group_by, groups = pp_util.get_groups(obs_id, configs, context)
+    group_result = pp_util.get_groups_result(obs_id, configs, context)
+    if group_result.outcome.failure is not None:
+        failure = group_result.outcome.failure
+        logger.error(
+            f"Could not discover groups for {obs_id}: "
+            f"{failure.category}: {failure.message}"
+        )
+        return
+    group_by = group_result.group_by
+    groups = group_result.groups
     all_groups = groups.copy()
     for g in all_groups:
         if group_list is not None:

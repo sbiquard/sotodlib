@@ -14,7 +14,7 @@ from collections import Counter
 from pathlib import Path
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from tqdm import tqdm
 from sotodlib.hwp import hwp_angle_model
 from sotodlib.coords import pointing_model
@@ -52,14 +52,6 @@ class PreprocessErrors:
     ExecutorFutureError = "executor_future_error"
     SkipMissingError = "skip_missing_error"
 
-    @classmethod
-    def get_errors(cls, e):
-        errmsg = f'{type(e)}: {e}'
-        tb = ''.join(traceback.format_tb(e.__traceback__))
-
-        return errmsg, tb
-
-
 class FailureSeverity(enum.Enum):
     """Operational severity of a preprocessing group failure."""
 
@@ -80,10 +72,25 @@ class PreprocessFailure:
 
     @classmethod
     def from_errors(cls, errors, exception=None):
+        """Convert a legacy ``(category, message, traceback)`` tuple."""
         if errors is None or errors[0] in (None, PreprocessErrors.LoadSuccess):
             return None
 
         category, message, tb = errors
+        return cls.from_category(category, message, tb, exception=exception)
+
+    @classmethod
+    def from_exception(cls, category, exception):
+        """Create a failure while the original exception is available."""
+        message = f'{type(exception)}: {exception}'
+        tb = ''.join(traceback.format_tb(exception.__traceback__))
+        return cls.from_category(
+            category, message, tb, exception=exception
+        )
+
+    @classmethod
+    def from_category(cls, category, message=None, tb=None, exception=None):
+        """Create a classified failure from its stable category."""
         layer = {
             PreprocessErrors.InitPipeLineRunError: "init",
             PreprocessErrors.InitPipelineStepError: "init",
@@ -127,6 +134,111 @@ class PreprocessFailure:
                 layer="proc",
             )
         return self
+
+
+class PreprocessStatus(enum.Enum):
+    """How a preprocessing operation completed."""
+
+    computed = "computed"
+    loaded = "loaded"
+    skipped = "skipped"
+    failed = "failed"
+
+
+@dataclass(frozen=True)
+class PreprocessOutcome:
+    """Structured completion status shared by preprocessing operations."""
+
+    status: PreprocessStatus
+    failure: PreprocessFailure | None = None
+
+    def __post_init__(self):
+        if self.status in (PreprocessStatus.failed, PreprocessStatus.skipped) \
+                and self.failure is None:
+            raise ValueError("A failed or skipped outcome requires a failure.")
+        if self.status in (PreprocessStatus.computed, PreprocessStatus.loaded) \
+                and self.failure is not None:
+            raise ValueError("A successful outcome cannot contain a failure.")
+
+    @property
+    def ok(self):
+        return self.status in (
+            PreprocessStatus.computed,
+            PreprocessStatus.loaded,
+        )
+
+    @classmethod
+    def computed(cls):
+        return cls(PreprocessStatus.computed)
+
+    @classmethod
+    def loaded(cls):
+        return cls(PreprocessStatus.loaded)
+
+    @classmethod
+    def skipped(cls, failure):
+        return cls(PreprocessStatus.skipped, failure)
+
+    @classmethod
+    def failed(cls, failure):
+        return cls(PreprocessStatus.failed, failure)
+
+    @classmethod
+    def from_legacy(cls, errors):
+        """Convert the historical error tuple at compatibility boundaries."""
+        if isinstance(errors, cls):
+            return errors
+        if errors is None or errors[0] is None:
+            return cls.computed()
+        if errors[0] == PreprocessErrors.LoadSuccess:
+            return cls.loaded()
+        if errors[0] == PreprocessErrors.SkipMissingError:
+            return cls.skipped(PreprocessFailure.from_errors(errors))
+        return cls.failed(PreprocessFailure.from_errors(errors))
+
+    def as_legacy_errors(self):
+        """Return the historical tuple for callers not yet migrated."""
+        if self.status == PreprocessStatus.loaded:
+            return PreprocessErrors.LoadSuccess, None, None
+        if self.failure is None:
+            return None, None, None
+        return (
+            self.failure.category,
+            self.failure.message,
+            self.failure.traceback,
+        )
+
+
+@dataclass(frozen=True)
+class GroupDiscoveryResult:
+    """Detector groups discovered for one observation."""
+
+    group_by: object
+    groups: list
+    outcome: PreprocessOutcome
+
+    def as_legacy_result(self):
+        return self.group_by, self.groups, self.outcome.as_legacy_errors()
+
+
+@dataclass(frozen=True)
+class PreprocessGroupResult:
+    """Products and status from preprocessing one detector group."""
+
+    aman: object = None
+    init_output: dict | None = None
+    proc_output: dict | None = None
+    outcome: PreprocessOutcome = field(
+        default_factory=PreprocessOutcome.computed
+    )
+
+    def as_legacy_result(self):
+        return (
+            self.aman,
+            self.init_output,
+            self.proc_output,
+            self.outcome.as_legacy_errors(),
+        )
 
 
 class PreprocessCircuitBreaker(RuntimeError):
@@ -627,7 +739,7 @@ def get_preprocess_context(configs, context=None):
     return configs, context
 
 
-def get_groups(obs_id, configs, context=None):
+def get_groups_result(obs_id, configs, context=None):
     """Get subobs group method and groups. To be used in
     ``preprocess_*.py`` site pipeline scripts.
 
@@ -642,12 +754,8 @@ def get_groups(obs_id, configs, context=None):
 
     Returns
     -------
-    group_by : list of str
-        The list of keys used to group the detectors.
-    groups : list of list of int
-        The list of groups of detectors.
-    errors : tuple
-        Tuple of errors or Nones.
+    result : GroupDiscoveryResult
+        Discovered grouping and a structured outcome.
     """
     try:
         if type(configs) == str:
@@ -661,16 +769,29 @@ def get_groups(obs_id, configs, context=None):
 
             if (gb == 'detset') and (len(group_by) == 1):
                 groups = context.obsfiledb.get_detsets(obs_id)
-                return group_by, [[g] for g in groups], (None, None, None)
+                return GroupDiscoveryResult(
+                    group_by, [[g] for g in groups],
+                    PreprocessOutcome.computed(),
+                )
 
         det_info = context.get_det_info(obs_id)
         rs = det_info.subset(keys=group_by).distinct()
         groups = [[b for a,b in r.items()] for r in rs]
-        return group_by, groups, (None, None, None)
+        return GroupDiscoveryResult(
+            group_by, groups, PreprocessOutcome.computed()
+        )
     except Exception as e:
-        error = PreprocessErrors.GetGroupsError
-        errmsg, tb = PreprocessErrors.get_errors(e)
-        return [], [], (error, errmsg, tb)
+        failure = PreprocessFailure.from_exception(
+            PreprocessErrors.GetGroupsError, e
+        )
+        return GroupDiscoveryResult(
+            [], [], PreprocessOutcome.failed(failure)
+        )
+
+
+def get_groups(obs_id, configs, context=None):
+    """Compatibility wrapper returning the historical three-tuple."""
+    return get_groups_result(obs_id, configs, context).as_legacy_result()
 
 
 def get_preprocess_db(configs, group_by, logger=None):
@@ -1419,8 +1540,8 @@ def save_group_and_cleanup(obs_id, configs, context=None, subdir='temp',
 
     Returns
     -------
-    errors : tuple
-        Error from get_groups.
+    outcome : PreprocessOutcome
+        Outcome from detector-group discovery.
     """
 
     if logger is None:
@@ -1432,7 +1553,9 @@ def save_group_and_cleanup(obs_id, configs, context=None, subdir='temp',
     if context is None:
         context = core.Context(configs["context_file"])
 
-    group_by, groups, errors = get_groups(obs_id, configs)
+    group_result = get_groups_result(obs_id, configs)
+    group_by = group_result.group_by
+    groups = group_result.groups
 
     all_groups = groups.copy()
     for g in all_groups:
@@ -1450,7 +1573,7 @@ def save_group_and_cleanup(obs_id, configs, context=None, subdir='temp',
             try:
                 if not remove:
                     cleanup_mandb(outputs_grp, (obs_id, g),
-                                  (None, None, None), configs, logger)
+                                  PreprocessOutcome.computed(), configs, logger)
                 else:
                     # if we're overwriting, remove file so it will re-run
                     os.remove(outputs_grp['temp_file'])
@@ -1461,7 +1584,7 @@ def save_group_and_cleanup(obs_id, configs, context=None, subdir='temp',
                     f"save_group_and_cleanup failed for {outputs_grp['temp_file']}:\n{errmsg}\n{tb}"
                 )
                 raise
-    return errors
+    return group_result.outcome
 
 
 def cleanup_obs(obs_id, policy_dir, errlog, configs, context=None,
@@ -1497,19 +1620,27 @@ def cleanup_obs(obs_id, policy_dir, errlog, configs, context=None,
                 break
 
         if found:
-            errors = save_group_and_cleanup(obs_id, configs, context,
-                                           subdir=subdir, remove=remove)
+            outcome = save_group_and_cleanup(obs_id, configs, context,
+                                             subdir=subdir, remove=remove)
 
-            if errors[0] is not None:
+            if outcome.failure is not None:
+                failure = outcome.failure
                 with open(errlog, 'a') as f:
-                    f.write(f"{time.time()}, {obs_id}, n/a', {errors[0]}\n")
-                    f.write("\t" + (errors[1] or "") + (errors[2] or "") + "\n")
+                    f.write(
+                        f"{time.time()}, {obs_id}, n/a', "
+                        f"{failure.category}\n"
+                    )
+                    f.write(
+                        "\t" + (failure.message or "")
+                        + (failure.traceback or "") + "\n"
+                    )
 
 
-def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
-                         logger=None, overwrite=False, save_archive=False,
-                         save_proc_aman=True, compress=False,
-                         skip_missing=False, ignore_cfg_check=False):
+def preproc_or_load_group_result(
+    obs_id, configs_init, dets, configs_proc=None, logger=None,
+    overwrite=False, save_archive=False, save_proc_aman=True,
+    compress=False, skip_missing=False, ignore_cfg_check=False,
+):
     """
     This function is expected to receive a single obs_id, and dets dictionary.
     The dets dictionary must match the grouping specified in the preprocess
@@ -1562,22 +1693,8 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
 
     Returns
     -------
-    aman : AxisManager or None
-        Preprocessed axis manager if preproc_or_load_group finished
-        successfully or None if it failed.
-    out_dict_init : dict or None
-        Dictionary output for init config from get_preproc_group_out_dict
-        if preprocessing ran successfully for init layer or ``None`` if
-        preprocessing was loaded or ``preproc_or_load_group`` failed.
-    out_dict_proc : dict or None
-        Dictionary output for proc config from get_preproc_group_out_dict
-        if preprocessing ran successfully for proc layer or ``None`` if
-        preprocessing was loaded, that layer was not run or loaded, or
-        ``preproc_or_load_group`` failed.
-    errors : tuple
-        A tuple containing the error from PreprocessError, an error message,
-        and the traceback. Each will be None if preproc_or_load_group finished
-        successfully.
+    result : PreprocessGroupResult
+        Products and structured completion outcome for this detector group.
     """
     init_temp_subdir = "temp"
     proc_temp_subdir = "temp_proc"
@@ -1614,9 +1731,16 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
                 raise ValueError('init and proc groups do not match')
 
     except Exception as e:
-        errmsg, tb = PreprocessErrors.get_errors(e)
-        logger.error(f"Get configs/context failed for {obs_id}: {group}\n{errmsg}\n{tb}")
-        return None, None, None, (PreprocessErrors.MetaDataError, errmsg, tb)
+        failure = PreprocessFailure.from_exception(
+            PreprocessErrors.MetaDataError, e
+        )
+        logger.error(
+            f"Get configs/context failed for {obs_id}: {group}\n"
+            f"{failure.message}\n{failure.traceback}"
+        )
+        return PreprocessGroupResult(
+            outcome=PreprocessOutcome.failed(failure)
+        )
 
     db_init_exist = find_db(obs_id, configs_init, dets, logger=logger)
     if configs_proc is not None:
@@ -1633,7 +1757,12 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
             and not db_init_exist
         ):
             logger.warn(f"{obs_id}: {group} not found in init db and skip missing={skip_missing}")
-            return None, None, None, (PreprocessErrors.SkipMissingError, None, None)
+            failure = PreprocessFailure.from_category(
+                PreprocessErrors.SkipMissingError
+            )
+            return PreprocessGroupResult(
+                outcome=PreprocessOutcome.skipped(failure)
+            )
         # proc db exists but entry not in proc db
         if (
             configs_proc is not None
@@ -1641,12 +1770,22 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
             and not db_proc_exist
         ):
             logger.warn(f"{obs_id}: {group} not found in proc db and skip missing={skip_missing}")
-            return None, None, None, (PreprocessErrors.SkipMissingError, None, None)
+            failure = PreprocessFailure.from_category(
+                PreprocessErrors.SkipMissingError
+            )
+            return PreprocessGroupResult(
+                outcome=PreprocessOutcome.skipped(failure)
+            )
 
     # Cannot run if proc db exists but init db does not
     if db_proc_exist and not db_init_exist and not overwrite:
         logger.error("loading from proc db requires init db if overwrite is False")
-        return None, None, None, (PreprocessErrors.NoInitDbError, None, None)
+        failure = PreprocessFailure.from_category(
+            PreprocessErrors.NoInitDbError
+        )
+        return PreprocessGroupResult(
+            outcome=PreprocessOutcome.failed(failure)
+        )
 
     # Load first layer only
     if not overwrite:
@@ -1662,14 +1801,25 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
                 aman, proc_aman = load_and_preprocess(obs_id=obs_id, dets=dets, configs=configs_init,
                                                       logger=logger, return_full_aman=return_full_aman)
             except Exception as e:
-                errmsg, tb = PreprocessErrors.get_errors(e)
-                logger.error(f"Initial layer Pipeline Load Error for {obs_id}: {group}\n{errmsg}\n{tb}")
-                return None, None, None, (PreprocessErrors.SingleLayerPipelineLoadError, errmsg, tb)
+                failure = PreprocessFailure.from_exception(
+                    PreprocessErrors.SingleLayerPipelineLoadError, e
+                )
+                logger.error(
+                    f"Initial layer Pipeline Load Error for {obs_id}: {group}\n"
+                    f"{failure.message}\n{failure.traceback}"
+                )
+                return PreprocessGroupResult(
+                    outcome=PreprocessOutcome.failed(failure)
+                )
 
             # Return if not running proc db
             if configs_proc is None:
                 logger.info(f"preproc_or_load_group finished successfully for {obs_id}:{group}")
-                return aman, out_dict_init, None, (PreprocessErrors.LoadSuccess, None, None)
+                return PreprocessGroupResult(
+                    aman=aman,
+                    init_output=out_dict_init,
+                    outcome=PreprocessOutcome.loaded(),
+                )
 
         # Load first and second layer
         elif db_init_exist and db_proc_exist:
@@ -1679,11 +1829,20 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
                                                       configs_proc=configs_proc, logger=logger,
                                                       ignore_cfg_check=ignore_cfg_check)
                 logger.info(f"preproc_or_load_group finished successfully for {obs_id}:{group}")
-                return aman, None, None, (PreprocessErrors.LoadSuccess, None, None)
+                return PreprocessGroupResult(
+                    aman=aman, outcome=PreprocessOutcome.loaded()
+                )
             except Exception as e:
-                errmsg, tb = PreprocessErrors.get_errors(e)
-                logger.error(f"Multilayer Pipeline Load Error for {obs_id}: {group}\n{errmsg}\n{tb}")
-                return None, None, None, (PreprocessErrors.MultilayerPipelineLoadError, errmsg, tb)
+                failure = PreprocessFailure.from_exception(
+                    PreprocessErrors.MultilayerPipelineLoadError, e
+                )
+                logger.error(
+                    f"Multilayer Pipeline Load Error for {obs_id}: {group}\n"
+                    f"{failure.message}\n{failure.traceback}"
+                )
+                return PreprocessGroupResult(
+                    outcome=PreprocessOutcome.failed(failure)
+                )
 
     # Run first layer
     if not db_init_exist or overwrite:
@@ -1706,13 +1865,23 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
             proc_aman, success = pipe_init.run(aman)
             aman.wrap('preprocess', proc_aman)
         except Exception as e:
-            errmsg, tb = PreprocessErrors.get_errors(e)
-            logger.error(f"Pipeline Run Error for {obs_id}: {group}\n{errmsg}\n{tb}")
-            return None, None, None, (PreprocessErrors.InitPipeLineRunError, errmsg, tb)
+            failure = PreprocessFailure.from_exception(
+                PreprocessErrors.InitPipeLineRunError, e
+            )
+            logger.error(
+                f"Pipeline Run Error for {obs_id}: {group}\n"
+                f"{failure.message}\n{failure.traceback}"
+            )
+            return PreprocessGroupResult(
+                outcome=PreprocessOutcome.failed(failure)
+            )
         if success != 'end':
             logger.error(f"Init Pipeline Step Error for {obs_id}: {group}\nFailed at step {success}")
-            return None, None, None, (
-                PreprocessErrors.InitPipelineStepError, success, None
+            failure = PreprocessFailure.from_category(
+                PreprocessErrors.InitPipelineStepError, success
+            )
+            return PreprocessGroupResult(
+                outcome=PreprocessOutcome.failed(failure)
             )
 
         if save_proc_aman:
@@ -1728,7 +1897,8 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
                            overwrite=overwrite)
             if save_archive:
                 logger.info(f"Adding result to init db for {obs_id}: {group}")
-                cleanup_mandb(out_dict_init, (obs_id, group), (None, None, None),
+                cleanup_mandb(out_dict_init, (obs_id, group),
+                              PreprocessOutcome.computed(),
                               configs_init, logger=logger, overwrite=overwrite)
         # Make init plots
         if make_lmsi_init:
@@ -1746,7 +1916,11 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
         # Return if not running proc db
         if configs_proc is None:
             logger.info(f"preproc_or_load_group finished successfully for {obs_id}:{group}")
-            return aman, out_dict_init, None, (None, None, None)
+            return PreprocessGroupResult(
+                aman=aman,
+                init_output=out_dict_init,
+                outcome=PreprocessOutcome.computed(),
+            )
 
     # Run second layer
     if (not db_proc_exist or overwrite) and configs_proc is not None:
@@ -1777,13 +1951,25 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
                 if init_field in proc_aman:
                     proc_aman.move(init_field, None)
         except Exception as e:
-            errmsg, tb = PreprocessErrors.get_errors(e)
-            logger.error(f"Pipeline Run Error for {obs_id}: {group}\n{errmsg}\n{tb}")
-            return None, out_dict_init, None, (PreprocessErrors.ProcPipeLineRunError, errmsg, tb)
+            failure = PreprocessFailure.from_exception(
+                PreprocessErrors.ProcPipeLineRunError, e
+            )
+            logger.error(
+                f"Pipeline Run Error for {obs_id}: {group}\n"
+                f"{failure.message}\n{failure.traceback}"
+            )
+            return PreprocessGroupResult(
+                init_output=out_dict_init,
+                outcome=PreprocessOutcome.failed(failure),
+            )
         if success != 'end':
             logger.error(f"Proc Pipeline Step Error for {obs_id}: {group}\nFailed at step {success}")
-            return None, out_dict_init, None, (
-                PreprocessErrors.ProcPipelineStepError, success, None
+            failure = PreprocessFailure.from_category(
+                PreprocessErrors.ProcPipelineStepError, success
+            )
+            return PreprocessGroupResult(
+                init_output=out_dict_init,
+                outcome=PreprocessOutcome.failed(failure),
             )
 
         if save_proc_aman:
@@ -1799,7 +1985,8 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
                            overwrite=overwrite)
             if save_archive:
                 logger.info(f"Adding result to proc db for {obs_id}: {group}")
-                cleanup_mandb(out_dict_proc, (obs_id, group), (None, None, None),
+                cleanup_mandb(out_dict_proc, (obs_id, group),
+                              PreprocessOutcome.computed(),
                               configs_proc, logger=logger, overwrite=overwrite)
         if 'valid_data' in aman.preprocess:
             aman.preprocess.move('valid_data', None)
@@ -1820,38 +2007,47 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
                           Path(os.path.join(new_plots, 'index.html')))
 
     logger.info(f"preproc_or_load_group finished successfully for {obs_id}:{group}")
-    return aman, out_dict_init, out_dict_proc, (None, None, None)
+    return PreprocessGroupResult(
+        aman=aman,
+        init_output=out_dict_init,
+        proc_output=out_dict_proc,
+        outcome=PreprocessOutcome.computed(),
+    )
 
 
-def cleanup_mandb(out_dict, out_meta, errors, configs, logger=None, overwrite=False, db_manager=None):
+def preproc_or_load_group(*args, **kwargs):
+    """Compatibility wrapper returning the historical four-tuple."""
+    return preproc_or_load_group_result(*args, **kwargs).as_legacy_result()
+
+
+def cleanup_mandb(out_dict, out_meta, outcome=None, configs=None, logger=None,
+                  overwrite=False, db_manager=None, **legacy_kwargs):
     """Function to update the manifest db when data is collected from the
     ``preproc_or_load_group`` function. If used in an mpi framework this
     function is expected to be run from rank 0 after a ``comm.gather``.
-    See the ``preproc_or_load_group`` docstring for the varying expected
-    values of ``errors`` and the associated ``out_dict``. This function will
+    See the ``preproc_or_load_group_result`` docstring for the expected
+    outcomes and associated ``out_dict``. This function will
     either:
 
     1) Update the ManifestDb sqlite file and move the h5 archive from its
-    temporary location to its permanent path if errors[0] is ``None``, out_dict
-    is not``None``. Deletes the temporary h5 file.
+    temporary location to its permanent path if ``out_dict`` is not ``None``.
+    Deletes the temporary h5 file after the manifest transaction commits.
 
-    2) Return nothing if errors[0] is ``PreprocessErrors.LoadSuccess`` or both it
-    and out_dict are None.
+    2) Return nothing for successful or loaded results without an output.
 
     3) Otherwise, update the error log.
 
     Arguments
     ---------
-    errors : tuple
-         A tuple containing the error from PreprocessError, an error message,
-        and the traceback. Each will be None if preproc_or_load_group finished
-        successfully.
     out_meta : tuple
         The tuple (obs_id, group).
-    outputs : dict
+    out_dict : dict
         Dictionary including entries for the temporary h5 filename
         ('temp_file') and the obs_id group metadata and db entry (db_data).
         See save_group for more info.
+    outcome : PreprocessOutcome or tuple
+        Structured operation outcome. Historical error tuples are accepted at
+        this compatibility boundary.
     configs : dict
         Preprocessing configuration dictionary.
     logger : PythonLogger
@@ -1866,6 +2062,14 @@ def cleanup_mandb(out_dict, out_meta, errors, configs, logger=None, overwrite=Fa
 
     if logger is None:
         logger = init_logger("preprocess")
+    if "errors" in legacy_kwargs:
+        if outcome is not None:
+            raise TypeError("Pass either outcome or errors, not both.")
+        outcome = legacy_kwargs.pop("errors")
+    if legacy_kwargs:
+        name = next(iter(legacy_kwargs))
+        raise TypeError(f"Unexpected keyword argument: {name}")
+    outcome = PreprocessOutcome.from_legacy(outcome)
 
     if out_dict is not None and os.path.isfile(out_dict['temp_file']):
         obs_id, group = out_meta
@@ -1922,19 +2126,30 @@ def cleanup_mandb(out_dict, out_meta, errors, configs, logger=None, overwrite=Fa
             finally:
                 # make sure we close the db each time
                 db.conn.close()
-    elif (
-        errors[0] == PreprocessErrors.LoadSuccess or
-        (errors[0] is None and out_dict is None)
-    ):
         return
-    else:
-        folder = os.path.dirname(configs['archive']['index'])
-        if not(os.path.exists(folder)):
-            os.makedirs(folder)
-        errlog = os.path.join(folder, 'errlog.txt')
-        with open(errlog, 'a') as f:
-            f.write(f"{time.time()}, {out_meta[0]}, {out_meta[1]}, {errors[0]}\n")
-            f.write("\t" + (errors[1] or "") + (errors[2] or "") + "\n")
+    elif outcome.ok:
+        if out_dict is None:
+            return
+        failure = PreprocessFailure.from_category(
+            PreprocessErrors.GroupOutputError,
+            f"Temporary archive file is missing: {out_dict['temp_file']}",
+        )
+        outcome = PreprocessOutcome.failed(failure)
+
+    folder = os.path.dirname(configs['archive']['index'])
+    if not(os.path.exists(folder)):
+        os.makedirs(folder)
+    errlog = os.path.join(folder, 'errlog.txt')
+    failure = outcome.failure
+    with open(errlog, 'a') as f:
+        f.write(
+            f"{time.time()}, {out_meta[0]}, {out_meta[1]}, "
+            f"{failure.category}\n"
+        )
+        f.write(
+            "\t" + (failure.message or "")
+            + (failure.traceback or "") + "\n"
+        )
 
 
 def get_pcfg_check_aman(pipe):

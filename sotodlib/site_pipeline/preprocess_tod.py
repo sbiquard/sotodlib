@@ -89,13 +89,12 @@ def load_preprocess_tod_sim(obs_id,
         return aman
 
 
-def preprocess_tod(configs: Union[str, dict],
-                   obs_id: str,
-                   group: dict,
-                   verbosity: int = 0,
-                   compress: bool = False,
-                   overwrite: bool = False,
-                  ):
+def preprocess_tod_result(configs: Union[str, dict],
+                          obs_id: str,
+                          group: dict,
+                          verbosity: int = 0,
+                          compress: bool = False,
+                          overwrite: bool = False):
     """Meant to be run as part of a batched script, this function calls the
     preprocessing pipeline a specific Observation ID and group combination
     and saves the results in the ManifestDb specified in the configs.
@@ -123,16 +122,14 @@ def preprocess_tod(configs: Union[str, dict],
         Dictionary output for init config from get_preproc_group_out_dict
         if preprocessing ran successfully for init layer or ``None`` if
         preprocessing was loaded or ``preproc_or_load_group`` failed.
-    errors : tuple
-        A tuple containing the error from PreprocessError, an error message,
-        and the traceback. Each will be None if preproc_or_load_group finished
-        successfully.
+    outcome : PreprocessOutcome
+        Structured preprocessing outcome.
     """
     logger = pp_util.init_logger("preprocess", verbosity=verbosity)
 
     group_by = np.atleast_1d(configs['subobs'].get('use', 'detset'))
     dets = {gb:gg for gb, gg in zip(group_by, group)}
-    aman, out_dict, _, errors = pp_util.preproc_or_load_group(
+    result = pp_util.preproc_or_load_group_result(
         obs_id=obs_id,
         configs_init=configs,
         dets=dets,
@@ -143,7 +140,13 @@ def preprocess_tod(configs: Union[str, dict],
         compress=compress,
     )
 
-    return out_dict, errors
+    return result.init_output, result.outcome
+
+
+def preprocess_tod(*args, **kwargs):
+    """Compatibility wrapper returning the historical error tuple."""
+    out_dict, outcome = preprocess_tod_result(*args, **kwargs)
+    return out_dict, outcome.as_legacy_errors()
 
 
 def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
@@ -232,25 +235,24 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
         futures = []
         futures_dict = {}
         for obs_id in obs_list:
-            futures.append(executor.submit(pp_util.get_groups, obs_id, configs))
+            futures.append(
+                executor.submit(pp_util.get_groups_result, obs_id, configs)
+            )
             futures_dict[futures[-1]] = obs_id
 
         for future in tqdm(as_completed_callable(futures), total=len(futures),
                            desc="building run list from obs list"):
             obs_id = futures_dict[future]
             try:
-                _, groups, get_groups_err = future.result()
+                group_result = future.result()
             except Exception as e:
-                errmsg, tb = PreprocessErrors.get_errors(e)
                 groups = []
-                get_groups_err = (
-                    PreprocessErrors.ExecutorFutureError, errmsg, tb
-                )
-                failure = pp_util.PreprocessFailure.from_errors(
-                    get_groups_err, exception=e
+                failure = pp_util.PreprocessFailure.from_exception(
+                    PreprocessErrors.ExecutorFutureError, e
                 )
             else:
-                failure = pp_util.PreprocessFailure.from_errors(get_groups_err)
+                groups = group_result.groups
+                failure = group_result.outcome.failure
 
             if failure is not None:
                 discovery_failures += 1
@@ -269,8 +271,7 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
                     except Exception:
                         logger.exception(
                             f"filtering groups for {obs_id} failed; "
-                            f"groups={groups}, entry={x}, "
-                            f"get_groups_err={get_groups_err}"
+                            f"groups={groups}, entry={x}"
                         )
 
 
@@ -334,7 +335,7 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
     for r in run_list:
         futures.append(
             executor.submit(
-                preprocess_tod,
+                preprocess_tod_result,
                 obs_id=r[0],
                 configs=configs,
                 group=r[1],
@@ -370,19 +371,20 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
                             miniters=max(1, total // 100)):
                 obs_id, group = futures_dict[future]
                 out_meta = (obs_id, group)
-                result_exception = None
                 try:
-                    out_dict, errors = future.result()
+                    out_dict, outcome = future.result()
                 except Exception as e:
-                    result_exception = e
-                    errmsg, tb = PreprocessErrors.get_errors(e)
-                    logger.error(f"Executor Future Result Error for {obs_id}: {group}:\n{errmsg}\n{tb}")
+                    failure = pp_util.PreprocessFailure.from_exception(
+                        PreprocessErrors.ExecutorFutureError, e
+                    )
+                    logger.error(
+                        f"Executor Future Result Error for {obs_id}: {group}:\n"
+                        f"{failure.message}\n{failure.traceback}"
+                    )
                     out_dict = None
-                    errors = (PreprocessErrors.ExecutorFutureError, errmsg, tb)
+                    outcome = pp_util.PreprocessOutcome.failed(failure)
 
-                failure = pp_util.PreprocessFailure.from_errors(
-                    errors, exception=result_exception
-                )
+                failure = outcome.failure
                 if failure is None:
                     logger.info(f"{obs_id}: {group} completed successfully")
                 else:
@@ -393,7 +395,7 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
 
                 futures.remove(future)
 
-                pp_util.cleanup_mandb(out_dict, out_meta, errors, configs,
+                pp_util.cleanup_mandb(out_dict, out_meta, outcome, configs,
                                     logger, overwrite, db_manager=db_manager)
 
 
