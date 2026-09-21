@@ -19,12 +19,23 @@ from sotodlib.site_pipeline.jobdb import JobManager, JState
 from sotodlib.preprocess import _Preprocess, Pipeline, processes
 import sotodlib.preprocess.preprocess_util as pp_util
 from sotodlib.preprocess.preprocess_util import PreprocessErrors
-from sotodlib.preprocess.archive_writer import ArchivePublisher
+from sotodlib.preprocess.archive_writer import (
+    ArchivePublisher,
+    split_mpi_archive_writer_ranks,
+    stop_mpi_archive_writer_ranks,
+)
 from sotodlib.site_pipeline.utils.pipeline import main_launcher
 from sotodlib.site_pipeline.utils.obsdb import get_obslist
 
 
 logger = pp_util.init_logger("preprocess")
+
+
+def _load_config(config):
+    if isinstance(config, dict):
+        return config
+    with open(config, "r") as stream:
+        return yaml.safe_load(stream)
 
 
 def _update_jobdb(jdb, jclass, obs_id, group, group_by, state, error=None):
@@ -50,6 +61,8 @@ def _recover_temp_files(
     writer_queue_depth,
     jdb,
     logger,
+    mpi_writer_comm=None,
+    mpi_writer_ranks=None,
 ):
     pending = []
     for archive_name in ("init", "proc"):
@@ -83,6 +96,8 @@ def _recover_temp_files(
             db_managers={"init": db_mgr_init, "proc": db_mgr_proc},
             lane_count=writer_lanes,
             queue_depth=writer_queue_depth,
+            mpi_comm=mpi_writer_comm,
+            writer_ranks=mpi_writer_ranks,
         )
         for archive_name, out_dict, (obs_id, group) in pending:
             key = (obs_id, tuple(group))
@@ -304,7 +319,9 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
           compress: bool = False,
           run_from_jobdb: bool = False,
           raise_error: bool = False,
-          pb_path: Optional[str] = None):
+          pb_path: Optional[str] = None,
+          mpi_writer_comm=None,
+          mpi_writer_ranks=None):
 
     init_temp_subdir = "temp"
     proc_temp_subdir = "temp_proc"
@@ -392,6 +409,8 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
             writer_queue_depth,
             jdb if jobdb_path is not None else None,
             logger,
+            mpi_writer_comm=mpi_writer_comm,
+            mpi_writer_ranks=mpi_writer_ranks,
         )
     else:
         for obs_id in obs_list:
@@ -555,6 +574,8 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
                     lane_count=writer_lanes,
                     queue_depth=writer_queue_depth,
                     overwrite=overwrite,
+                    mpi_comm=mpi_writer_comm,
+                    writer_ranks=mpi_writer_ranks,
                 )
             for future in tqdm(as_completed_callable(futures), total=total,
                                 desc="multilayer_preprocess_tod", file=f,
@@ -776,26 +797,59 @@ def main(configs_init: str,
          raise_error: bool = False,
          pb_path: Optional[str] = None):
 
-    rank, executor, as_completed_callable = get_exec_env(nproc)
+    config_init_data = _load_config(configs_init)
+    config_proc_data = _load_config(configs_proc)
+    lane_values = {
+        value for value in (
+            config_init_data['archive'].get('writer_lanes', 0),
+            config_proc_data['archive'].get('writer_lanes', 0),
+        ) if value
+    }
+    if len(lane_values) > 1:
+        raise ValueError("init and proc archive writer_lanes must match")
+    writer_lanes = lane_values.pop() if lane_values else 0
+
+    compute_comm, writer_setup, is_writer = (
+        split_mpi_archive_writer_ranks(writer_lanes)
+    )
+    if is_writer:
+        return
+
+    rank, executor, as_completed_callable = get_exec_env(
+        nproc,
+        mpi_comm=compute_comm,
+    )
     if rank == 0:
-        _main(executor=executor,
-              as_completed_callable=as_completed_callable,
-              configs_init=configs_init,
-              configs_proc=configs_proc,
-              query=query,
-              obs_id=obs_id,
-              overwrite=overwrite,
-              min_ctime=min_ctime,
-              max_ctime=max_ctime,
-              update_delay=update_delay,
-              tags=tags,
-              planet_obs=planet_obs,
-              verbosity=verbosity,
-              nproc=nproc,
-              compress=compress,
-              run_from_jobdb=run_from_jobdb,
-              raise_error=raise_error,
-              pb_path=pb_path)
+        mpi_writer_comm, mpi_writer_ranks = (
+            writer_setup if writer_setup is not None else (None, None)
+        )
+        try:
+            _main(executor=executor,
+                  as_completed_callable=as_completed_callable,
+                  configs_init=configs_init,
+                  configs_proc=configs_proc,
+                  query=query,
+                  obs_id=obs_id,
+                  overwrite=overwrite,
+                  min_ctime=min_ctime,
+                  max_ctime=max_ctime,
+                  update_delay=update_delay,
+                  tags=tags,
+                  planet_obs=planet_obs,
+                  verbosity=verbosity,
+                  nproc=nproc,
+                  compress=compress,
+                  run_from_jobdb=run_from_jobdb,
+                  raise_error=raise_error,
+                  pb_path=pb_path,
+                  mpi_writer_comm=mpi_writer_comm,
+                  mpi_writer_ranks=mpi_writer_ranks)
+        finally:
+            if mpi_writer_comm is not None:
+                stop_mpi_archive_writer_ranks(
+                    mpi_writer_comm,
+                    mpi_writer_ranks,
+                )
 
 
 if __name__ == '__main__':

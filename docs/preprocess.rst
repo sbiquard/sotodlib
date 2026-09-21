@@ -208,8 +208,10 @@ processing pipeline would look like::
             type: 'simple'
             filename: 'preprocess_archive.h5'
         batch_size: 50
-        # Optional parallel archive consolidation. Each writer owns an
-        # independent sequence of approximately 10 GB HDF5 files.
+        # Optional parallel archive consolidation. In MPI runs, the final
+        # writer_lanes ranks are reserved as archive writers and excluded from
+        # the compute executor. Each writer owns an independent sequence of
+        # approximately 10 GB HDF5 files.
         writer_lanes: 4
         writer_queue_depth: 8
         max_file_size: 10000000000
