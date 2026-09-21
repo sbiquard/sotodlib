@@ -8,9 +8,13 @@ import numpy as np
 import h5py
 import traceback
 import inspect
+import enum
+import sqlite3
+from collections import Counter
 from pathlib import Path
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from tqdm import tqdm
 from sotodlib.hwp import hwp_angle_model
 from sotodlib.coords import pointing_model
@@ -40,6 +44,9 @@ class PreprocessErrors:
     InitPipeLineRunError = "init_pipeline_run_error"
     ProcPipeLineRunError = "proc_pipeline_run_error"
     PipeLineStepError = "pipeline_step_error"
+    InitPipelineStepError = "init_pipeline_step_error"
+    ProcPipelineStepError = "proc_pipeline_step_error"
+    BlockedByInitError = "blocked_by_init_error"
     NoInitDbError = "no_init_db_error"
     GroupOutputError = "group_output_error"
     ExecutorFutureError = "executor_future_error"
@@ -51,6 +58,193 @@ class PreprocessErrors:
         tb = ''.join(traceback.format_tb(e.__traceback__))
 
         return errmsg, tb
+
+
+class FailureSeverity(enum.Enum):
+    """Operational severity of a preprocessing group failure."""
+
+    expected = "expected"
+    unexpected = "unexpected"
+    infrastructure = "infrastructure"
+
+
+@dataclass(frozen=True)
+class PreprocessFailure:
+    """Structured interpretation of the legacy preprocessing error tuple."""
+
+    category: str
+    message: str | None = None
+    traceback: str | None = None
+    layer: str = "both"
+    severity: FailureSeverity = FailureSeverity.unexpected
+
+    @classmethod
+    def from_errors(cls, errors, exception=None):
+        if errors is None or errors[0] in (None, PreprocessErrors.LoadSuccess):
+            return None
+
+        category, message, tb = errors
+        layer = {
+            PreprocessErrors.InitPipeLineRunError: "init",
+            PreprocessErrors.InitPipelineStepError: "init",
+            PreprocessErrors.SingleLayerPipelineLoadError: "init",
+            PreprocessErrors.ProcPipeLineRunError: "proc",
+            PreprocessErrors.ProcPipelineStepError: "proc",
+        }.get(category, "both")
+
+        if category in (
+            PreprocessErrors.PipeLineStepError,
+            PreprocessErrors.InitPipelineStepError,
+            PreprocessErrors.ProcPipelineStepError,
+            PreprocessErrors.SkipMissingError,
+        ):
+            severity = FailureSeverity.expected
+        elif isinstance(exception, (OSError, sqlite3.DatabaseError)):
+            severity = FailureSeverity.infrastructure
+        elif message and any(name in message for name in (
+            "OSError", "IOError", "sqlite3.", "h5py.",
+            "DatabaseError", "OperationalError",
+        )):
+            severity = FailureSeverity.infrastructure
+        else:
+            severity = FailureSeverity.unexpected
+
+        return cls(category, message, tb, layer, severity)
+
+    @property
+    def fingerprint(self):
+        detail = (self.message or "").splitlines()[0]
+        return self.category, self.layer, detail
+
+    def for_layer(self, layer):
+        """Return the failure affecting ``layer``, or ``None`` on success."""
+        if self.layer == "proc" and layer == "init":
+            return None
+        if self.layer == "init" and layer == "proc":
+            return replace(
+                self,
+                category=PreprocessErrors.BlockedByInitError,
+                layer="proc",
+            )
+        return self
+
+
+class PreprocessCircuitBreaker(RuntimeError):
+    """Raised when one unexpected failure repeats beyond the configured limit."""
+
+
+class PreprocessFailureSummary(RuntimeError):
+    """Raised when the completed run violates its failure policy."""
+
+
+class PreprocessFailureTracker:
+    """Collect failures and enforce end-of-run and repeated-error policies."""
+
+    def __init__(self, max_repeated_error=10):
+        if max_repeated_error == 0:
+            max_repeated_error = None
+        elif max_repeated_error is not None and max_repeated_error < 0:
+            raise ValueError("max_repeated_error must be nonnegative or None.")
+        self.max_repeated_error = max_repeated_error
+        self.records = []
+        self.fingerprints = Counter()
+
+    def record(self, obs_id, group, failure):
+        if failure is None:
+            return
+        self.records.append((obs_id, group, failure))
+        self.fingerprints[failure.fingerprint] += 1
+
+        if failure.severity == FailureSeverity.infrastructure:
+            raise PreprocessCircuitBreaker(
+                f"Infrastructure failure for {obs_id} {group}: "
+                f"{failure.category}: {failure.message}"
+            )
+        repeats = self.fingerprints[failure.fingerprint]
+        if (
+            failure.severity == FailureSeverity.unexpected
+            and self.max_repeated_error is not None
+            and repeats >= self.max_repeated_error
+        ):
+            raise PreprocessCircuitBreaker(
+                f"Repeated preprocessing failure reached {repeats} groups: "
+                f"{failure.category}: {failure.message}"
+            )
+
+    def summary(self, total_groups):
+        by_severity = Counter(
+            failure.severity.value for _, _, failure in self.records
+        )
+        by_category = Counter(
+            failure.category for _, _, failure in self.records
+        )
+        return {
+            "total_groups": total_groups,
+            "failed_groups": len(self.records),
+            "failed_fraction": (
+                len(self.records) / total_groups if total_groups else 0.0
+            ),
+            "by_severity": dict(by_severity),
+            "by_category": dict(by_category),
+        }
+
+    def raise_if_needed(self, total_groups, raise_error=False,
+                        max_failed_groups=None, max_failed_fraction=None):
+        if max_failed_groups is not None and max_failed_groups < 0:
+            raise ValueError("max_failed_groups must be nonnegative or None.")
+        if (max_failed_fraction is not None
+                and not 0 <= max_failed_fraction <= 1):
+            raise ValueError(
+                "max_failed_fraction must be between zero and one or None."
+            )
+        summary = self.summary(total_groups)
+        reasons = []
+        unexpected = sum(
+            failure.severity != FailureSeverity.expected
+            for _, _, failure in self.records
+        )
+        if unexpected:
+            reasons.append(f"{unexpected} unexpected/infrastructure failures")
+        if raise_error and self.records:
+            reasons.append("--raise-error requested")
+        if (max_failed_groups is not None
+                and len(self.records) > max_failed_groups):
+            reasons.append(
+                f"{len(self.records)} failures exceeded {max_failed_groups}"
+            )
+        if (max_failed_fraction is not None
+                and summary["failed_fraction"] > max_failed_fraction):
+            reasons.append(
+                f"failure fraction {summary['failed_fraction']:.3f} exceeded "
+                f"{max_failed_fraction:.3f}"
+            )
+        if reasons:
+            raise PreprocessFailureSummary(
+                "; ".join(reasons) + f"; summary={summary}"
+            )
+        return summary
+
+
+def add_failure_policy_args(parser):
+    """Add common preprocessing failure-policy arguments to a CLI parser."""
+    parser.add_argument(
+        '--raise-error',
+        help="Return a nonzero status if any group fails.",
+        action='store_true',
+    )
+    parser.add_argument(
+        '--max-failed-groups', type=int, default=None,
+        help="Return a nonzero status if more than this many groups fail.",
+    )
+    parser.add_argument(
+        '--max-failed-fraction', type=float, default=None,
+        help="Return a nonzero status if the failed group fraction exceeds this value.",
+    )
+    parser.add_argument(
+        '--max-repeated-error', type=int, default=10,
+        help="Stop after this many identical unexpected failures; 0 disables the limit.",
+    )
+    return parser
 
 
 def get_jobdb_config(configs):
@@ -107,6 +301,22 @@ def update_jobdb(jdb, updates):
             for tag in job._tags:
                 if tag.key == "error":
                     tag.value = update["error"]
+
+
+def get_jobdb_update(job, failure, layer="init"):
+    """Build a layer-aware JobDB update for one preprocessing result."""
+    layer_failure = failure.for_layer(layer) if failure is not None else None
+    if layer_failure is None:
+        jstate = JState.done
+        error = None
+    elif layer_failure.severity == FailureSeverity.infrastructure:
+        # Infrastructure failures should remain retryable.
+        jstate = JState.open
+        error = layer_failure.category
+    else:
+        jstate = JState.failed
+        error = layer_failure.category
+    return {"job": job, "error": error, "jstate": jstate}
 
 
 def _get_aman_encodings(encodings, field):
@@ -1511,7 +1721,9 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
             return None, None, None, (PreprocessErrors.InitPipeLineRunError, errmsg, tb)
         if success != 'end':
             logger.error(f"Init Pipeline Step Error for {obs_id}: {group}\nFailed at step {success}")
-            return None, None, None, (PreprocessErrors.PipeLineStepError, success, None)
+            return None, None, None, (
+                PreprocessErrors.InitPipelineStepError, success, None
+            )
 
         if save_proc_aman:
             logger.info(f"Saving preprocessing axis manager to "
@@ -1580,7 +1792,9 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
             return None, out_dict_init, None, (PreprocessErrors.ProcPipeLineRunError, errmsg, tb)
         if success != 'end':
             logger.error(f"Proc Pipeline Step Error for {obs_id}: {group}\nFailed at step {success}")
-            return None, out_dict_init, None, (PreprocessErrors.PipeLineStepError, success, None)
+            return None, out_dict_init, None, (
+                PreprocessErrors.ProcPipelineStepError, success, None
+            )
 
         if save_proc_aman:
             logger.info(f"Saving proc axis manager to "

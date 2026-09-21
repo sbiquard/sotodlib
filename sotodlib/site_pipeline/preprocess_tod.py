@@ -162,6 +162,9 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
           compress: bool = False,
           run_from_jobdb: bool = False,
           raise_error: bool = False,
+          max_failed_groups: Optional[int] = None,
+          max_failed_fraction: Optional[float] = None,
+          max_repeated_error: Optional[int] = 10,
           pb_path: Optional[str] = None):
 
     temp_subdir = "temp"
@@ -298,7 +301,7 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
 
     futures = []
     futures_dict = {}
-    obs_errors = {}
+    failure_tracker = pp_util.PreprocessFailureTracker(max_repeated_error)
 
     for r in run_list:
         futures.append(
@@ -313,8 +316,6 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
             )
         )
         futures_dict[futures[-1]] = (r[0], r[1])
-        if r[0] not in obs_errors:
-            obs_errors[r[0]] = []
 
     total = len(futures)
 
@@ -341,16 +342,26 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
                             miniters=max(1, total // 100)):
                 obs_id, group = futures_dict[future]
                 out_meta = (obs_id, group)
+                result_exception = None
                 try:
                     out_dict, errors = future.result()
-                    obs_errors[obs_id].append({'group': group, 'error': errors[0]})
-                    logger.info(f"{obs_id}: {group} extracted successfully")
                 except Exception as e:
+                    result_exception = e
                     errmsg, tb = PreprocessErrors.get_errors(e)
                     logger.error(f"Executor Future Result Error for {obs_id}: {group}:\n{errmsg}\n{tb}")
-                    obs_errors[obs_id].append({'group': group, 'error': PreprocessErrors.ExecutorFutureError})
                     out_dict = None
                     errors = (PreprocessErrors.ExecutorFutureError, errmsg, tb)
+
+                failure = pp_util.PreprocessFailure.from_errors(
+                    errors, exception=result_exception
+                )
+                if failure is None:
+                    logger.info(f"{obs_id}: {group} completed successfully")
+                else:
+                    logger.warning(
+                        f"{obs_id}: {group} completed with "
+                        f"{failure.severity.value} failure {failure.category}"
+                    )
 
                 futures.remove(future)
 
@@ -364,19 +375,12 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
                     for gb, g in zip(group_by, group):
                         tags['dets:' + gb] = g
 
-                    if errors[0] is not None:
-                        jstate = JState.failed
-                        jerror = errors[0]
-                    else:
-                        jstate = JState.done
-                        jerror = None
-
                     batched_job_fields.append(
-                        {
-                            "job": tags_to_job[frozenset(tags.items())],
-                            "error": jerror,
-                            "jstate": jstate,
-                        }
+                        pp_util.get_jobdb_update(
+                            tags_to_job[frozenset(tags.items())],
+                            failure,
+                            layer="init",
+                        )
                     )
 
                     batched_job_count += 1
@@ -386,21 +390,24 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
                         batched_job_count = 0
                         batched_job_fields = []
 
-    if raise_error:
-        n_obs_fail = 0
-        n_groups_fail = 0
-        for obs_id, out_meta in obs_errors.items():
-            if all(entry['error'] is not None for entry in out_meta):
-                n_obs_fail += 1
-                n_groups_fail += len(out_meta)
-            else:
-                for entry in out_meta:
-                    if entry['error'] is not None:
-                        n_groups_fail += 1
+                try:
+                    failure_tracker.record(obs_id, group, failure)
+                except pp_util.PreprocessCircuitBreaker:
+                    db_manager.force_commit()
+                    if jobdb_path is not None and batched_job_fields:
+                        pp_util.update_jobdb(jdb, batched_job_fields)
+                        batched_job_count = 0
+                        batched_job_fields = []
+                    raise
 
-        if n_groups_fail > 0:
-            raise RuntimeError(f"preprocess_tod ended with {n_obs_fail}/{len(obs_errors)} "
-                               f"failed obsids and {n_groups_fail}/{len(run_list)} failed groups")
+    failure_summary = failure_tracker.summary(len(run_list))
+    logger.info(f"Preprocessing failure summary: {failure_summary}")
+    failure_tracker.raise_if_needed(
+        len(run_list),
+        raise_error=raise_error,
+        max_failed_groups=max_failed_groups,
+        max_failed_fraction=max_failed_fraction,
+    )
     logger.info("preprocess_tod is done")
 
 
@@ -471,12 +478,7 @@ def get_parser(parser=None):
         default=False,
         action='store_true',
     )
-    parser.add_argument(
-        '--raise-error',
-        help="Raise an error upon completion if any obsids or groups fail.",
-        type=bool,
-        default=False
-    )
+    pp_util.add_failure_policy_args(parser)
     parser.add_argument(
         '--pb-path',
         help="Path to where to save progress bar.",
@@ -500,6 +502,9 @@ def main(configs: str,
          compress: bool = False,
          run_from_jobdb: bool = False,
          raise_error: bool = False,
+         max_failed_groups: Optional[int] = None,
+         max_failed_fraction: Optional[float] = None,
+         max_repeated_error: Optional[int] = 10,
          pb_path: Optional[str] = None):
 
     rank, executor, as_completed_callable = get_exec_env(nproc)
@@ -520,6 +525,9 @@ def main(configs: str,
               compress=compress,
               run_from_jobdb=run_from_jobdb,
               raise_error=raise_error,
+              max_failed_groups=max_failed_groups,
+              max_failed_fraction=max_failed_fraction,
+              max_repeated_error=max_repeated_error,
               pb_path=pb_path)
 
 if __name__ == '__main__':
