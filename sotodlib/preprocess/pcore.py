@@ -579,7 +579,8 @@ class Pipeline(list):
             plt.close()
             if select:
                 process.select(aman, proc_aman)
-                proc_aman.restrict('dets', aman.dets.vals)
+                if not np.array_equal(proc_aman.dets.vals, aman.dets.vals):
+                    proc_aman.restrict('dets', aman.dets.vals)
             self.logger.debug(f"{proc_aman.dets.count} detectors remaining")
 
             if aman.dets.count == 0:
