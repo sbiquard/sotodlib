@@ -33,7 +33,6 @@ class PreprocessErrors:
     """Stores the various errors that can occur from the preprocessing
     functions.
     """
-    LoadSuccess = "load_success"
     GetGroupsError = "get_groups_error"
     MetaDataError = "get_meta_data_error"
     NoDetsRemainError = "no_dets_remain_error"
@@ -62,22 +61,13 @@ class FailureSeverity(enum.Enum):
 
 @dataclass(frozen=True)
 class PreprocessFailure:
-    """Structured interpretation of the legacy preprocessing error tuple."""
+    """A classified preprocessing failure."""
 
     category: str
     message: str | None = None
     traceback: str | None = None
     layer: str = "both"
     severity: FailureSeverity = FailureSeverity.unexpected
-
-    @classmethod
-    def from_errors(cls, errors, exception=None):
-        """Convert a legacy ``(category, message, traceback)`` tuple."""
-        if errors is None or errors[0] in (None, PreprocessErrors.LoadSuccess):
-            return None
-
-        category, message, tb = errors
-        return cls.from_category(category, message, tb, exception=exception)
 
     @classmethod
     def from_exception(cls, category, exception):
@@ -183,32 +173,6 @@ class PreprocessOutcome:
     def failed(cls, failure):
         return cls(PreprocessStatus.failed, failure)
 
-    @classmethod
-    def from_legacy(cls, errors):
-        """Convert the historical error tuple at compatibility boundaries."""
-        if isinstance(errors, cls):
-            return errors
-        if errors is None or errors[0] is None:
-            return cls.computed()
-        if errors[0] == PreprocessErrors.LoadSuccess:
-            return cls.loaded()
-        if errors[0] == PreprocessErrors.SkipMissingError:
-            return cls.skipped(PreprocessFailure.from_errors(errors))
-        return cls.failed(PreprocessFailure.from_errors(errors))
-
-    def as_legacy_errors(self):
-        """Return the historical tuple for callers not yet migrated."""
-        if self.status == PreprocessStatus.loaded:
-            return PreprocessErrors.LoadSuccess, None, None
-        if self.failure is None:
-            return None, None, None
-        return (
-            self.failure.category,
-            self.failure.message,
-            self.failure.traceback,
-        )
-
-
 @dataclass(frozen=True)
 class GroupDiscoveryResult:
     """Detector groups discovered for one observation."""
@@ -216,10 +180,6 @@ class GroupDiscoveryResult:
     group_by: object
     groups: list
     outcome: PreprocessOutcome
-
-    def as_legacy_result(self):
-        return self.group_by, self.groups, self.outcome.as_legacy_errors()
-
 
 @dataclass(frozen=True)
 class PreprocessGroupResult:
@@ -231,15 +191,6 @@ class PreprocessGroupResult:
     outcome: PreprocessOutcome = field(
         default_factory=PreprocessOutcome.computed
     )
-
-    def as_legacy_result(self):
-        return (
-            self.aman,
-            self.init_output,
-            self.proc_output,
-            self.outcome.as_legacy_errors(),
-        )
-
 
 class PreprocessCircuitBreaker(RuntimeError):
     """Raised when one unexpected failure repeats beyond the configured limit."""
@@ -739,7 +690,7 @@ def get_preprocess_context(configs, context=None):
     return configs, context
 
 
-def get_groups_result(obs_id, configs, context=None):
+def get_groups(obs_id, configs, context=None):
     """Get subobs group method and groups. To be used in
     ``preprocess_*.py`` site pipeline scripts.
 
@@ -787,13 +738,6 @@ def get_groups_result(obs_id, configs, context=None):
         return GroupDiscoveryResult(
             [], [], PreprocessOutcome.failed(failure)
         )
-
-
-def get_groups(obs_id, configs, context=None):
-    """Compatibility wrapper returning the historical three-tuple."""
-    return get_groups_result(obs_id, configs, context).as_legacy_result()
-
-
 def get_preprocess_db(configs, group_by, logger=None):
     """Get or create a ManifestDb found for a given
     config.
@@ -1553,7 +1497,7 @@ def save_group_and_cleanup(obs_id, configs, context=None, subdir='temp',
     if context is None:
         context = core.Context(configs["context_file"])
 
-    group_result = get_groups_result(obs_id, configs)
+    group_result = get_groups(obs_id, configs)
     group_by = group_result.group_by
     groups = group_result.groups
 
@@ -1636,7 +1580,7 @@ def cleanup_obs(obs_id, policy_dir, errlog, configs, context=None,
                     )
 
 
-def preproc_or_load_group_result(
+def preproc_or_load_group(
     obs_id, configs_init, dets, configs_proc=None, logger=None,
     overwrite=False, save_archive=False, save_proc_aman=True,
     compress=False, skip_missing=False, ignore_cfg_check=False,
@@ -2013,19 +1957,12 @@ def preproc_or_load_group_result(
         proc_output=out_dict_proc,
         outcome=PreprocessOutcome.computed(),
     )
-
-
-def preproc_or_load_group(*args, **kwargs):
-    """Compatibility wrapper returning the historical four-tuple."""
-    return preproc_or_load_group_result(*args, **kwargs).as_legacy_result()
-
-
-def cleanup_mandb(out_dict, out_meta, outcome=None, configs=None, logger=None,
-                  overwrite=False, db_manager=None, **legacy_kwargs):
+def cleanup_mandb(out_dict, out_meta, outcome, configs, logger=None,
+                  overwrite=False, db_manager=None):
     """Function to update the manifest db when data is collected from the
     ``preproc_or_load_group`` function. If used in an mpi framework this
     function is expected to be run from rank 0 after a ``comm.gather``.
-    See the ``preproc_or_load_group_result`` docstring for the expected
+    See the ``preproc_or_load_group`` docstring for the expected
     outcomes and associated ``out_dict``. This function will
     either:
 
@@ -2045,9 +1982,8 @@ def cleanup_mandb(out_dict, out_meta, outcome=None, configs=None, logger=None,
         Dictionary including entries for the temporary h5 filename
         ('temp_file') and the obs_id group metadata and db entry (db_data).
         See save_group for more info.
-    outcome : PreprocessOutcome or tuple
-        Structured operation outcome. Historical error tuples are accepted at
-        this compatibility boundary.
+    outcome : PreprocessOutcome
+        Structured operation outcome.
     configs : dict
         Preprocessing configuration dictionary.
     logger : PythonLogger
@@ -2062,14 +1998,8 @@ def cleanup_mandb(out_dict, out_meta, outcome=None, configs=None, logger=None,
 
     if logger is None:
         logger = init_logger("preprocess")
-    if "errors" in legacy_kwargs:
-        if outcome is not None:
-            raise TypeError("Pass either outcome or errors, not both.")
-        outcome = legacy_kwargs.pop("errors")
-    if legacy_kwargs:
-        name = next(iter(legacy_kwargs))
-        raise TypeError(f"Unexpected keyword argument: {name}")
-    outcome = PreprocessOutcome.from_legacy(outcome)
+    if not isinstance(outcome, PreprocessOutcome):
+        raise TypeError("outcome must be a PreprocessOutcome")
 
     if out_dict is not None and os.path.isfile(out_dict['temp_file']):
         obs_id, group = out_meta

@@ -26,7 +26,7 @@ from sotodlib.site_pipeline.utils.obsdb import get_obslist
 logger = pp_util.init_logger("preprocess")
 
 
-def multilayer_preprocess_tod_result(obs_id: str,
+def multilayer_preprocess_tod(obs_id: str,
                                      configs_init: Union[str, dict],
                                      configs_proc: Union[str, dict],
                                      group: list,
@@ -74,7 +74,7 @@ def multilayer_preprocess_tod_result(obs_id: str,
 
     group_by = np.atleast_1d(configs_proc['subobs'].get('use', 'detset'))
     dets = {gb:gg for gb, gg in zip(group_by, group)}
-    result = pp_util.preproc_or_load_group_result(
+    result = pp_util.preproc_or_load_group(
         obs_id=obs_id,
         configs_init=configs_init,
         dets=dets,
@@ -86,16 +86,6 @@ def multilayer_preprocess_tod_result(obs_id: str,
     )
 
     return result.init_output, result.proc_output, result.outcome
-
-
-def multilayer_preprocess_tod(*args, **kwargs):
-    """Compatibility wrapper returning the historical error tuple."""
-    out_init, out_proc, outcome = multilayer_preprocess_tod_result(
-        *args, **kwargs
-    )
-    return out_init, out_proc, outcome.as_legacy_errors()
-
-
 def _check_init_jobdb(
     jdb,
     init_db,
@@ -297,7 +287,7 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
         for obs_id in obs_list:
             futures.append(
                 executor.submit(
-                    pp_util.get_groups_result, obs_id, configs_proc
+                    pp_util.get_groups, obs_id, configs_proc
                 )
             )
             futures_dict[futures[-1]] = obs_id
@@ -425,7 +415,7 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
 
     for r in run_list:
         futures.append(
-            executor.submit(multilayer_preprocess_tod_result,
+            executor.submit(multilayer_preprocess_tod,
                 obs_id=r[0],
                 configs_init=configs_init,
                 configs_proc=configs_proc,

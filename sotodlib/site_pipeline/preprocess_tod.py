@@ -89,7 +89,7 @@ def load_preprocess_tod_sim(obs_id,
         return aman
 
 
-def preprocess_tod_result(configs: Union[str, dict],
+def preprocess_tod(configs: Union[str, dict],
                           obs_id: str,
                           group: dict,
                           verbosity: int = 0,
@@ -129,7 +129,7 @@ def preprocess_tod_result(configs: Union[str, dict],
 
     group_by = np.atleast_1d(configs['subobs'].get('use', 'detset'))
     dets = {gb:gg for gb, gg in zip(group_by, group)}
-    result = pp_util.preproc_or_load_group_result(
+    result = pp_util.preproc_or_load_group(
         obs_id=obs_id,
         configs_init=configs,
         dets=dets,
@@ -141,14 +141,6 @@ def preprocess_tod_result(configs: Union[str, dict],
     )
 
     return result.init_output, result.outcome
-
-
-def preprocess_tod(*args, **kwargs):
-    """Compatibility wrapper returning the historical error tuple."""
-    out_dict, outcome = preprocess_tod_result(*args, **kwargs)
-    return out_dict, outcome.as_legacy_errors()
-
-
 def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
           as_completed_callable: Callable,
           configs: str,
@@ -236,7 +228,7 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
         futures_dict = {}
         for obs_id in obs_list:
             futures.append(
-                executor.submit(pp_util.get_groups_result, obs_id, configs)
+                executor.submit(pp_util.get_groups, obs_id, configs)
             )
             futures_dict[futures[-1]] = obs_id
 
@@ -335,7 +327,7 @@ def _main(executor: Union["MPICommExecutor", "ProcessPoolExecutor"],
     for r in run_list:
         futures.append(
             executor.submit(
-                preprocess_tod_result,
+                preprocess_tod,
                 obs_id=r[0],
                 configs=configs,
                 group=r[1],

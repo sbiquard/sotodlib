@@ -33,7 +33,7 @@ def plot_preprocess_tod(obs_id, configs, context, group_list=None, verbosity=2):
     """
     logger = init_logger("preprocess", verbosity=verbosity)
 
-    group_result = pp_util.get_groups_result(obs_id, configs, context)
+    group_result = pp_util.get_groups(obs_id, configs, context)
     if group_result.outcome.failure is not None:
         failure = group_result.outcome.failure
         logger.error(

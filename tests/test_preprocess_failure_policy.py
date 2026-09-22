@@ -14,7 +14,7 @@ from ._helpers import mpi_multi
 
 @unittest.skipIf(mpi_multi(), "Running with multiple MPI processes")
 class TestPreprocessFailurePolicy(unittest.TestCase):
-    def test_structured_outcome_and_legacy_adapter(self):
+    def test_structured_outcome(self):
         failure = pp_util.PreprocessFailure.from_category(
             pp_util.PreprocessErrors.ProcPipeLineRunError,
             "ValueError: failed",
@@ -22,27 +22,12 @@ class TestPreprocessFailurePolicy(unittest.TestCase):
         )
         outcome = pp_util.PreprocessOutcome.failed(failure)
         self.assertFalse(outcome.ok)
-        self.assertEqual(
-            outcome.as_legacy_errors(),
-            (
-                pp_util.PreprocessErrors.ProcPipeLineRunError,
-                "ValueError: failed",
-                "traceback",
-            ),
-        )
-        self.assertEqual(
-            pp_util.PreprocessOutcome.from_legacy(
-                outcome.as_legacy_errors()
-            ),
-            outcome,
-        )
-
         result = pp_util.PreprocessGroupResult(
             init_output={"temp_file": "temp.h5"}, outcome=outcome
         )
         self.assertEqual(pickle.loads(pickle.dumps(result)), result)
 
-    def test_group_discovery_result_and_legacy_adapter(self):
+    def test_group_discovery_result(self):
         class ObsFileDb:
             def get_detsets(self, obs_id):
                 return ["ds1", "ds2"]
@@ -51,23 +36,18 @@ class TestPreprocessFailurePolicy(unittest.TestCase):
             obsfiledb = ObsFileDb()
 
         configs = {"subobs": {"use": "detset"}}
-        result = pp_util.get_groups_result("obs", configs, Context())
+        result = pp_util.get_groups("obs", configs, Context())
         self.assertTrue(result.outcome.ok)
         self.assertEqual(result.groups, [["ds1"], ["ds2"]])
-        self.assertEqual(
-            pp_util.get_groups("obs", configs, Context()),
-            (result.group_by, result.groups, (None, None, None)),
-        )
 
-    def test_cleanup_accepts_legacy_errors_keyword(self):
-        self.assertIsNone(
+    def test_cleanup_requires_structured_outcome(self):
+        with self.assertRaises(TypeError):
             pp_util.cleanup_mandb(
                 None,
                 ("obs", ["group"]),
-                errors=(None, None, None),
+                (None, None, None),
                 configs={},
             )
-        )
 
     def test_worker_entry_points_return_structured_outcomes(self):
         outcome = pp_util.PreprocessOutcome.computed()
@@ -78,52 +58,38 @@ class TestPreprocessFailurePolicy(unittest.TestCase):
         )
         configs = {"subobs": {"use": "detset"}}
         with mock.patch.object(
-            pp_util, "preproc_or_load_group_result", return_value=result
+            pp_util, "preproc_or_load_group", return_value=result
         ):
             self.assertEqual(
-                preprocess_tod.preprocess_tod_result(
+                preprocess_tod.preprocess_tod(
                     configs, "obs", ["ds"]
                 ),
                 (result.init_output, outcome),
             )
             self.assertEqual(
-                multilayer_preprocess_tod.multilayer_preprocess_tod_result(
+                multilayer_preprocess_tod.multilayer_preprocess_tod(
                     "obs", configs, configs, ["ds"]
                 ),
                 (result.init_output, result.proc_output, outcome),
             )
-            self.assertEqual(
-                preprocess_tod.preprocess_tod(configs, "obs", ["ds"]),
-                (result.init_output, (None, None, None)),
-            )
-            self.assertEqual(
-                multilayer_preprocess_tod.multilayer_preprocess_tod(
-                    "obs", configs, configs, ["ds"]
-                ),
-                (
-                    result.init_output,
-                    result.proc_output,
-                    (None, None, None),
-                ),
-            )
 
     def test_layer_classification(self):
-        proc_failure = pp_util.PreprocessFailure.from_errors((
+        proc_failure = pp_util.PreprocessFailure.from_category(
             pp_util.PreprocessErrors.ProcPipelineStepError,
             "no detectors remain",
             None,
-        ))
+        )
         self.assertEqual(proc_failure.layer, "proc")
         self.assertEqual(
             proc_failure.severity, pp_util.FailureSeverity.expected
         )
         self.assertIsNone(proc_failure.for_layer("init"))
 
-        init_failure = pp_util.PreprocessFailure.from_errors((
+        init_failure = pp_util.PreprocessFailure.from_category(
             pp_util.PreprocessErrors.InitPipeLineRunError,
             "bad configuration",
             None,
-        ))
+        )
         self.assertEqual(init_failure.layer, "init")
         self.assertEqual(
             init_failure.for_layer("proc").category,
@@ -131,18 +97,18 @@ class TestPreprocessFailurePolicy(unittest.TestCase):
         )
 
     def test_circuit_breakers(self):
-        failure = pp_util.PreprocessFailure.from_errors((
+        failure = pp_util.PreprocessFailure.from_category(
             pp_util.PreprocessErrors.ExecutorFutureError,
             "ValueError: repeated bug",
             None,
-        ))
+        )
         tracker = pp_util.PreprocessFailureTracker(max_repeated_error=2)
         tracker.record("obs1", ["g1"], failure)
         with self.assertRaises(pp_util.PreprocessCircuitBreaker):
             tracker.record("obs2", ["g2"], failure)
 
-        infrastructure = pp_util.PreprocessFailure.from_errors(
-            (pp_util.PreprocessErrors.ExecutorFutureError, "disk", None),
+        infrastructure = pp_util.PreprocessFailure.from_category(
+            pp_util.PreprocessErrors.ExecutorFutureError, "disk", None,
             exception=OSError("disk"),
         )
         with self.assertRaises(pp_util.PreprocessCircuitBreaker):
@@ -151,11 +117,11 @@ class TestPreprocessFailurePolicy(unittest.TestCase):
             )
 
     def test_end_of_run_policy(self):
-        expected = pp_util.PreprocessFailure.from_errors((
+        expected = pp_util.PreprocessFailure.from_category(
             pp_util.PreprocessErrors.InitPipelineStepError,
             "selection removed all detectors",
             None,
-        ))
+        )
         tracker = pp_util.PreprocessFailureTracker(max_repeated_error=0)
         tracker.record("obs", ["group"], expected)
         tracker.raise_if_needed(total_groups=2)
@@ -182,11 +148,11 @@ class TestPreprocessFailurePolicy(unittest.TestCase):
             proc_job = manager.create_job(
                 "proc", {"obs:obs_id": "obs", "error": None}
             )
-            failure = pp_util.PreprocessFailure.from_errors((
+            failure = pp_util.PreprocessFailure.from_category(
                 pp_util.PreprocessErrors.ProcPipeLineRunError,
                 "ValueError: proc failed",
                 None,
-            ))
+            )
             pp_util.update_jobdb(manager, [
                 pp_util.get_jobdb_update(init_job, failure, "init"),
                 pp_util.get_jobdb_update(proc_job, failure, "proc"),

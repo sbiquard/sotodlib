@@ -497,7 +497,7 @@ def write_demod_maps(prefix, data, info, unit='K', split_labels=['full']):
             data.signal.write(prefix, "%s_hits"%split_labels[n_split],
                               data.signal.hits[n_split], unit='hits')
 
-def make_demod_map_result(context, obslist, noise_model, info,
+def make_demod_map(context, obslist, noise_model, info,
                           preprocess_config, prefix, shape=None, wcs=None,
                           nside=None, comm=mpi.COMM_WORLD, comps="TQU", t0=0,
                           dtype_tod=np.float32, dtype_map=np.float32,
@@ -607,7 +607,7 @@ def make_demod_map_result(context, obslist, noise_model, info,
     for oi in range(len(obslist)):
         obs_id, detset, band = obslist[oi][:3]
         name = "%s:%s:%s" % (obs_id, detset, band)
-        result = preprocess_util.preproc_or_load_group_result(
+        result = preprocess_util.preproc_or_load_group(
             obs_id,
             configs_init=preproc_init,
             configs_proc=preproc_proc,
@@ -663,14 +663,6 @@ def make_demod_map_result(context, obslist, noise_model, info,
     # output to files
     write_demod_maps(prefix, mapdata, info, split_labels=split_labels, unit=unit)
     return outcomes, outputs, info
-
-
-def make_demod_map(*args, **kwargs):
-    """Compatibility wrapper returning historical error-category strings."""
-    outcomes, outputs, info = make_demod_map_result(*args, **kwargs)
-    errors = [outcome.as_legacy_errors()[0] for outcome in outcomes]
-    return errors, outputs, info
-
 def add_weights_to_info(info, weights, split_labels):
     Nsplits = len(split_labels)
     for isplit in range(Nsplits):

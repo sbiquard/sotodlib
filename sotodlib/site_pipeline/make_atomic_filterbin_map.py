@@ -474,7 +474,7 @@ def main(
             run_list.append([obslist, None, None, info_list, prefix, t, tag])
 
     futures = [executor.submit(
-            mapmaking.make_demod_map_result, args.context, r[0],
+            mapmaking.make_demod_map, args.context, r[0],
             noise_model, r[3], preprocess_config, r[4],
             shape=r[1], wcs=r[2], nside=args.nside,
             comm=FakeCommunicator(), t0=r[5], tag=r[6],
@@ -503,7 +503,7 @@ def main(
             future_write_to_log(e, errlog[-1])
             continue
         futures.remove(future)
-        for ii in range(len(errors)):
+        for ii in range(len(outcomes)):
             for idx_prepoc in range(len(preprocess_config)):
                 if outputs[ii][idx_prepoc] is not None:
                     oid = outputs[ii][idx_prepoc]['db_data']['obs:obs_id']
