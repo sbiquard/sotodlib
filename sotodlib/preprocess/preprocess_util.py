@@ -596,7 +596,8 @@ def multilayer_load_and_preprocess(obs_id, configs_init, configs_proc,
                                    dets=None, meta=None, no_signal=None,
                                    logger=None, init_only=False,
                                    ignore_cfg_check=False,
-                                   stop_for_sims=False):
+                                   stop_for_sims=False, context_init=None,
+                                   context_proc=None):
     """Loads the saved information from the preprocessing pipeline from a
     reference and a dependent database and runs the processing section of
     the pipeline for each.
@@ -635,6 +636,9 @@ def multilayer_load_and_preprocess(obs_id, configs_init, configs_proc,
         with the flag `use_data_aman` set to True. The intended use is
         to prepare all necessary data products that cannot be stored in
         the preprocessing database, to process simulations.
+    context_init, context_proc : core.Context, optional
+        Contexts to reuse for the initial and dependent layers. If omitted,
+        each is loaded from its corresponding configuration.
 
     Returns
     -------
@@ -646,10 +650,10 @@ def multilayer_load_and_preprocess(obs_id, configs_init, configs_proc,
     if logger is None:
         logger = init_logger("preprocess")
 
-    configs_init, context_init = get_preprocess_context(configs_init)
+    configs_init, context_init = get_preprocess_context(configs_init, context_init)
     meta_init = context_init.get_meta(obs_id, dets=dets, meta=meta)
 
-    configs_proc, context_proc = get_preprocess_context(configs_proc)
+    configs_proc, context_proc = get_preprocess_context(configs_proc, context_proc)
     meta_proc = context_proc.get_meta(obs_id, dets=dets, meta=meta)
 
     # Count number of stops
@@ -984,7 +988,7 @@ def find_db(obs_id, configs, dets, context=None, logger=None):
     dets : dict
         Dictionary specifying which detectors/wafers to load see ``Context.obsdb.get_obs``.
     context : core.Context
-        Optional. Context object used for data loading/querying.
+        Optional. Accepted for compatibility; the database lookup does not use it.
     logger : PythonLogger
         Optional. Logger object or None will generate a new one.
 
@@ -999,8 +1003,6 @@ def find_db(obs_id, configs, dets, context=None, logger=None):
 
     if type(configs) == str:
         configs = yaml.safe_load(open(configs, "r"))
-    if context is None:
-        context = core.Context(configs["context_file"])
     group_by = np.atleast_1d(configs['subobs'].get('use', 'detset'))
     cur_groups = [list(np.fromiter(dets.values(), dtype='<U32'))]
     dbexist = True
@@ -1081,7 +1083,7 @@ def get_preproc_group_out_dict(obs_id, configs, dets, context=None, subdir='temp
         Dictionary specifying which detectors/wafers to load see
         ``Context.obsdb.get_obs``.
     context : core.Context
-        Optional. Context object used for data loading/querying.
+        Optional. Accepted for compatibility; the output path does not use it.
     subdir : str
         Optional. Subdirectory to save the output files into.  If it does not
         exist, it is created.
@@ -1095,9 +1097,6 @@ def get_preproc_group_out_dict(obs_id, configs, dets, context=None, subdir='temp
 
     if type(configs) == str:
         configs = yaml.safe_load(open(configs, "r"))
-    if context is None:
-        context = core.Context(configs["context_file"])
-
     cur_groups = [list(np.fromiter(dets.values(), dtype='<U32'))]
     group_by = np.atleast_1d(configs['subobs'].get('use', 'detset'))
     newpath = f'{subdir}/{obs_id}'
@@ -1404,7 +1403,8 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
                     return_full_aman = False
                 logger.info(f"Loading and applying preprocessing for initial layer db on {obs_id}:{group}")
                 aman, proc_aman = load_and_preprocess(obs_id=obs_id, dets=dets, configs=configs_init,
-                                                      logger=logger, return_full_aman=return_full_aman)
+                                                      context=context_init, logger=logger,
+                                                      return_full_aman=return_full_aman)
             except Exception as e:
                 errmsg, tb = PreprocessErrors.get_errors(e)
                 logger.error(f"Initial layer Pipeline Load Error for {obs_id}: {group}\n{errmsg}\n{tb}")
@@ -1421,7 +1421,8 @@ def preproc_or_load_group(obs_id, configs_init, dets, configs_proc=None,
                 logger.info(f"Loading and applying preprocessing for both dbs on {obs_id}:{group}")
                 aman = multilayer_load_and_preprocess(obs_id=obs_id, dets=dets, configs_init=configs_init,
                                                       configs_proc=configs_proc, logger=logger,
-                                                      ignore_cfg_check=ignore_cfg_check)
+                                                      ignore_cfg_check=ignore_cfg_check,
+                                                      context_init=context_init, context_proc=context_proc)
                 logger.info(f"preproc_or_load_group finished successfully for {obs_id}:{group}")
                 return aman, None, None, (PreprocessErrors.LoadSuccess, None, None)
             except Exception as e:
