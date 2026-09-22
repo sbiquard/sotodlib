@@ -588,7 +588,7 @@ def load_and_preprocess(obs_id, configs, context=None, dets=None, meta=None,
     else:
         pipe = Pipeline(configs["process_pipe"], logger=logger)
         aman = context.get_obs(meta, no_signal=no_signal)
-        pipe.run(aman, aman.preprocess, select=False)
+        pipe.run(aman, aman.preprocess, select=False, build_full_aman=False)
         return aman, full_aman
 
 
@@ -731,7 +731,7 @@ def multilayer_load_and_preprocess(obs_id, configs_init, configs_proc,
                 if init_only:
                     return out_amans_init
             else:
-                pipe_init.run(aman, aman.preprocess, select=False)
+                pipe_init.run(aman, aman.preprocess, select=False, build_full_aman=False)
                 if init_only:
                     return aman
 
@@ -756,7 +756,7 @@ def multilayer_load_and_preprocess(obs_id, configs_init, configs_proc,
                 })
                 return out_amans
             else:
-                pipe_proc.run(aman, aman.preprocess, select=False)
+                pipe_proc.run(aman, aman.preprocess, select=False, build_full_aman=False)
                 return aman
         else:
             raise ValueError('Dependency check between configs failed.')
@@ -801,7 +801,7 @@ def run_pipeline_stepgroups(pipe, aman, run_last_step=False):
         loc_aman = aman.copy()
         for (step, name), pipe in pipes.items():
             if pipe is not None:
-                pipe.run(loc_aman, aman.preprocess, select=False)
+                pipe.run(loc_aman, aman.preprocess, select=False, build_full_aman=False)
             out_amans[step, name] = loc_aman.copy()
         return out_amans
     else:
@@ -952,7 +952,7 @@ def multilayer_load_and_preprocess_sim(obs_id, configs_init, configs_proc,
                               interpol=interpol, sight=sight)
 
             logger.info("Running initial pipeline")
-            pipe_init.run(aman, aman.preprocess, sim=True)
+            pipe_init.run(aman, aman.preprocess, sim=True, build_full_aman=False)
 
             if init_only:
                 return aman
@@ -962,7 +962,8 @@ def multilayer_load_and_preprocess_sim(obs_id, configs_init, configs_proc,
             if 'valid_data' in aman.preprocess:
                 aman.preprocess.move('valid_data', None)
             aman.preprocess.merge(proc_aman.preprocess)
-            pipe_proc.run(aman, aman.preprocess, sim=True, data_amans=data_amans)
+            pipe_proc.run(aman, aman.preprocess, sim=True, data_amans=data_amans,
+                          build_full_aman=False)
 
             return aman
         else:

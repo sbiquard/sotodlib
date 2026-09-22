@@ -448,7 +448,8 @@ class Pipeline(list):
     
 
     def run(self, aman, proc_aman=None, full_aman=None, select=True,
-            sim=False, update_plot=False, data_amans=None):
+            sim=False, update_plot=False, data_amans=None,
+            build_full_aman=True):
         """
         The main workhorse function for the pipeline class. This function takes
         an AxisManager TOD and successively runs the pipeline of preprocessing
@@ -495,17 +496,23 @@ class Pipeline(list):
             filled with AxisManager processed up to step-1. This is used
             to pre-load all data AxisManager which could be required when
             processing simulations (e.g. to provide a T2P template)
+        build_full_aman: bool (Optional)
+            If False when replaying saved preprocessing, skip copying the
+            preprocessing AxisManager when the full return value is unused.
 
         Returns
         -------
-        full_aman: AxisManager
+        full_aman: AxisManager or None
             A preprocess axismanager that contains all data products calculated
-            throughout the running of the pipeline.
+            throughout the running of the pipeline, or None when
+            ``build_full_aman=False`` and no full_aman was supplied.
         success: str
             A string that stores the name of the last process step that the pipeline
             completed.  If the pipeline successfully finishes all steps, success = 'end'.
         """
         if proc_aman is None:
+            if not build_full_aman:
+                raise ValueError("build_full_aman=False requires proc_aman")
             if 'preprocess' in aman:
                 proc_aman = aman.preprocess.copy()
                 if full_aman is None:
@@ -522,7 +529,7 @@ class Pipeline(list):
                 det_list = [det for det in proc_aman.dets.vals if det in aman.dets.vals]
                 aman.restrict('dets', det_list)
                 proc_aman.restrict('dets', det_list)
-            if full_aman is None:
+            if full_aman is None and build_full_aman:
                 full_aman = proc_aman.copy()
             run_calc = False
 
@@ -584,9 +591,10 @@ class Pipeline(list):
                               wrap_name='valid_data')
 
         # copy updated frequency cutoffs to full_aman
-        if "frequency_cutoffs" in full_aman:
-            full_aman.move("frequency_cutoffs", None)
-        full_aman.wrap("frequency_cutoffs", proc_aman["frequency_cutoffs"])
+        if full_aman is not None:
+            if "frequency_cutoffs" in full_aman:
+                full_aman.move("frequency_cutoffs", None)
+            full_aman.wrap("frequency_cutoffs", proc_aman["frequency_cutoffs"])
 
         return full_aman, success
 
