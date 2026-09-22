@@ -1021,11 +1021,16 @@ class Calibrate(_Preprocess):
                 cal_arr = _f(proc_aman)
             else:
                 cal_arr = _f(aman)
-            cal_arr = cal_arr.astype(np.float32)
-            if self.process_cfgs.get("divide", False):
-                aman[self.signal] = np.divide(aman[self.signal].T, cal_arr).T
-            else:
-                aman[self.signal] = np.multiply(aman[self.signal].T, cal_arr).T
+            cal_arr = cal_arr.astype(np.float32, copy=False)
+            signal = aman[self.signal]
+            # Keep calibration in place when it does not change the signal dtype.
+            can_update = (signal.flags.writeable and
+                          np.can_cast(np.result_type(signal.dtype, cal_arr.dtype),
+                                      signal.dtype, casting='safe'))
+            operation = np.divide if self.process_cfgs.get("divide", False) else np.multiply
+            result = operation(signal.T, cal_arr, out=signal.T if can_update else None)
+            if not can_update:
+                aman[self.signal] = result.T
         else:
             raise ValueError(f"Entry '{self.process_cfgs['kind']}'"
                               " not understood")
