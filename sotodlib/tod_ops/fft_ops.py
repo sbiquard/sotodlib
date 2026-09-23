@@ -358,7 +358,7 @@ def calc_psd(
         else:
             nseg = int((stop - start) / kwargs["nperseg"])
 
-        freqs, Pxx = welch(signal[:, start:stop], fs, **kwargs)
+        freqs, Pxx = _welch_by_rows(signal[:, start:stop], fs, **kwargs)
         axis_map_pxx = [(0, aman[label_axis]), (1, "nusamps")]
         axis_map_nseg = None
 
@@ -390,6 +390,29 @@ def calc_psd(
         return freqs, Pxx, nseg
     else:
         return freqs, Pxx
+
+
+def _welch_by_rows(signal, fs, max_chunk_bytes=2**28, **kwargs):
+    """``scipy.signal.welch`` along the last axis of a 2D array, a block of
+    rows at a time.
+
+    Welch treats each row independently, so the result is identical to a
+    single call, but the intermediate arrays scipy allocates (several times
+    the input size) only ever cover one block.
+    """
+    if signal.ndim != 2 or kwargs.get('axis', -1) not in (-1, 1):
+        return welch(signal, fs, **kwargs)
+    row_bytes = max(1, signal.shape[1] * signal.itemsize)
+    chunk = max(1, max_chunk_bytes // row_bytes)
+    if chunk >= signal.shape[0]:
+        return welch(signal, fs, **kwargs)
+    Pxx = None
+    for i in range(0, signal.shape[0], chunk):
+        freqs, p = welch(signal[i:i + chunk], fs, **kwargs)
+        if Pxx is None:
+            Pxx = np.empty((signal.shape[0], p.shape[-1]), dtype=p.dtype)
+        Pxx[i:i + chunk] = p
+    return freqs, Pxx
 
 
 def _calc_psd_subscan(aman, signal=None, freq_spacing=None, full_output=False, **kwargs):
