@@ -39,7 +39,13 @@ def _check_azcoverage(aman, flags, az=None, coverage_threshold=0.95,
         tot_range = np.ptp(az)
     if isinstance(flags, str):
         flags = aman.flags.get(flags)
-    coverages = np.array([np.ptp(az[fl])/tot_range if sum(fl) != 0 else 0 for fl in ~flags.mask()])
+    coverages = np.zeros(len(flags.ranges))
+    for i, r in enumerate(flags.ranges):
+        valid = ~r.mask()
+        if valid.any():
+            az_max = np.max(az, where=valid, initial=-np.inf)
+            az_min = np.min(az, where=valid, initial=np.inf)
+            coverages[i] = (az_max - az_min) / tot_range
     return coverages < coverage_threshold, coverages
 
 
