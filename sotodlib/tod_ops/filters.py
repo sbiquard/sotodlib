@@ -308,8 +308,8 @@ fft_apply_filter = FilterApplyFunc.deco
 
 # Filtering Functions
 #################
-@fft_filter
-def counter_1_over_f(freqs, tod, fk=None, n=None):
+@fft_apply_filter
+def counter_1_over_f(target, freqs, tod, fk=None, n=None):
     """
     Counter 1/f filter for noise w/ PSD that follows:
     
@@ -331,9 +331,19 @@ def counter_1_over_f(freqs, tod, fk=None, n=None):
     if (fk is None or n is None):
         raise ValueError("You must input the (fk, n).")
     elif np.isscalar(fk) and np.isscalar(n):
-        return 1/(1+(fk/freqs)**n)
+        filt = 1/(1+(fk/freqs)**n)
+        if target is None:
+            return filt
+        target *= filt
     elif len(fk) == tod.dets.count and len(n) == tod.dets.count:
-        return 1 / (1 + (fk[:, None]/freqs[None,:])**n[:, None])
+        if target is None:
+            return 1 / (1 + (fk[:, None]/freqs[None,:])**n[:, None])
+        # Apply one detector at a time rather than building the full
+        # (dets, freqs) transfer function.  One-element slices keep the
+        # arithmetic identical to the broadcast expression above.
+        assert len(fk) == len(target)
+        for i, dest in enumerate(target):
+            dest *= 1 / (1 + (fk[i:i+1]/freqs)**n[i:i+1])
     else:
         raise ValueError("The fk and n must be a float value or array-like with length of number of detectors")
 
