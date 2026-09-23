@@ -163,6 +163,47 @@ def _fit_one_det(binned_signal_i, x_bin, m, sigma_i, max_mode):
     return coeffs, binned_model, ssq, redchi2
 
 
+def _legendre_model(x_samp, coeffs, out, rows, chunk=4096):
+    """
+    Evaluate the Legendre series ``coeffs`` (n_rows, n_modes) at ``x_samp``
+    into ``out[rows]``, a chunk of samples at a time.
+
+    Same result as ``L.legval(x_samp, coeffs.T)``, but uses a matrix product
+    with the Legendre basis and never allocates a (n_rows, n_samps) float64
+    temporary.
+    """
+    deg = coeffs.shape[-1] - 1
+    for s in range(0, len(x_samp), chunk):
+        sl = slice(s, s + chunk)
+        out[rows, sl] = coeffs @ L.legvander(x_samp[sl], deg).T
+    return out
+
+
+def _interp_model(x, xp, fp, out, rows, chunk=4096):
+    """
+    Linearly interpolate each row of ``fp`` (sampled at increasing ``xp``)
+    onto ``x`` and write the result into ``out[rows]``.
+
+    Same result as ``interp1d(xp, fp, fill_value='extrapolate')(x)``: values
+    outside ``xp`` are extrapolated from the end segments.  Works a chunk of
+    samples at a time to avoid (n_rows, n_samps) float64 temporaries.
+
+    Each chunk is a matrix product with the (n_bins, n_chunk) interpolation
+    weights, which have two non-zero entries per sample.
+    """
+    nb = len(xp)
+    j = np.clip(np.searchsorted(xp, x) - 1, 0, nb - 2)
+    t = (x - xp[j]) / (xp[j + 1] - xp[j])
+    for s in range(0, len(x), chunk):
+        sl = slice(s, s + chunk)
+        cols = np.arange(len(j[sl]))
+        w = np.zeros((nb, len(cols)))
+        w[j[sl], cols] = 1 - t[sl]
+        w[j[sl] + 1, cols] = t[sl]
+        out[rows, sl] = fp @ w
+    return out
+
+
 def fit_azss(az, azss_stats, max_mode, modes_axis_name='azss_modes', fit_range=None, overwrite=False):
     """
     Function for fitting Legendre polynomials to signal binned in azimuth.
@@ -222,7 +263,8 @@ def fit_azss(az, azss_stats, max_mode, modes_axis_name='azss_modes', fit_range=N
             az, azss_stats.binned_az, m, fit_range, bin_width)
 
         if use_cached:
-            return L.legval(x_samp, azss_stats.coeffs.T)
+            return _legendre_model(x_samp, azss_stats.coeffs, model,
+                                   slice(None))
 
         # Vectorized Legendre fit over all valid detectors at once.
         c = L.legfit(x_legendre_bin_centers[m],
@@ -231,7 +273,7 @@ def fit_azss(az, azss_stats, max_mode, modes_axis_name='azss_modes', fit_range=N
         coeffs[valid_dets] = c
         bm = L.legval(x_legendre_bin_centers, c.T)
         binned_model[valid_dets] = np.where(m, bm, np.nan)
-        model[valid_dets] = L.legval(x_samp, c.T)
+        _legendre_model(x_samp, c, model, valid_dets)
 
         diff = azss_stats.binned_signal[valid_dets][:, m] - bm[:, m]
         sum_of_squares[valid_dets] = np.sum(diff**2, axis=-1)
@@ -246,7 +288,8 @@ def fit_azss(az, azss_stats, max_mode, modes_axis_name='azss_modes', fit_range=N
             x_samp, x_legendre_bin_centers = _legendre_x(
                 az, azss_stats.binned_az, m_i, fit_range, bin_width)
             if use_cached:
-                model[i] = L.legval(x_samp, azss_stats.coeffs[i])
+                _legendre_model(x_samp, azss_stats.coeffs[i:i + 1], model,
+                                slice(i, i + 1))
                 continue
             (coeffs[i],
              binned_model[i],
@@ -254,7 +297,7 @@ def fit_azss(az, azss_stats, max_mode, modes_axis_name='azss_modes', fit_range=N
              redchi2s[i]) = _fit_one_det(
                 azss_stats.binned_signal[i], x_legendre_bin_centers, m_i,
                 azss_stats.uniform_binned_signal_sigma[i], max_mode)
-            model[i] = L.legval(x_samp, coeffs[i])
+            _legendre_model(x_samp, coeffs[i:i + 1], model, slice(i, i + 1))
 
         if use_cached:
             return model
@@ -475,13 +518,15 @@ def get_azss_model(aman, azss_stats, az=None, method='interpolate',
                                     m_2d[valid_dets].all(axis=0))
         if is_uniform:
             m = m_2d[valid_dets][0]
-            f_template = interp1d(azss_stats.binned_az[m], azss_stats.binned_signal[:, m][valid_dets, :], fill_value='extrapolate')
-            model[valid_dets, :] = f_template(az)
+            _interp_model(az, azss_stats.binned_az[m],
+                          azss_stats.binned_signal[:, m][valid_dets, :],
+                          model, valid_dets)
         else:
             for i in np.where(valid_dets)[0]:
                 m = m_2d[i]
-                f_template = interp1d(azss_stats.binned_az[m], azss_stats.binned_signal[i][m], fill_value='extrapolate')
-                model[i, :] = f_template(az)
+                _interp_model(az, azss_stats.binned_az[m],
+                              azss_stats.binned_signal[i:i + 1, m],
+                              model, slice(i, i + 1))
 
     if np.any(~np.isfinite(model)):
         logger.warning('azss model has nan. set zero to nan but this may make glitch')
