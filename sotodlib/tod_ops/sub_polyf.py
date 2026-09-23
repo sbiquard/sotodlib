@@ -143,14 +143,14 @@ def subscan_polyfilter(aman, degree, signal_name="signal", exclude_turnarounds=F
             else :
                 # if mask is matrix like, we should interpolate TOD det by det.
                 if is_matrix :
-                    if np.sum((mask_array[:,start:end]).astype(np.int32)) > 0 :
-                        msk_indx = mask_array[:,start:end]                        
-                        for idet in range(tod_mat.shape[0]) : 
-                            n_intep =  np.sum((mask_array[idet,start:end]).astype(np.int32))
-                            if n_intep > 0:
-                                if n_intep == tod_mat.shape[1] : continue
-                                interped = np.interp(np.flatnonzero(msk_indx[idet]),np.flatnonzero(~msk_indx[idet]), tod_mat[idet][~msk_indx[idet]])
-                                tod_mat[idet,msk_indx[idet]] = interped                            
+                    msk_indx = mask_array[:,start:end]
+                    n_intep = np.count_nonzero(msk_indx, axis=1)
+                    if n_intep.any() :
+                        # Only dets with some, but not all, samples masked.
+                        partial = (n_intep > 0) & (n_intep < tod_mat.shape[1])
+                        for idet in np.flatnonzero(partial) :
+                            interped = np.interp(np.flatnonzero(msk_indx[idet]),np.flatnonzero(~msk_indx[idet]), tod_mat[idet][~msk_indx[idet]])
+                            tod_mat[idet,msk_indx[idet]] = interped                            
                     else:
                         # If mask does not affect this range, just go through.
                         pass
