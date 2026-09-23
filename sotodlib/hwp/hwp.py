@@ -672,17 +672,25 @@ def demod_tod(aman, signal=None, demod_mode=4,
 
     phasor = np.empty_like(aman.hwp_angle, dtype=np.promote_types(signal.dtype, np.complex64))
     np.exp((demod_mode * 1j * aman.hwp_angle), out=phasor)
-    demod = tod_ops.fourier_filter(aman, bpf, detrend=None,
-                                   signal_name=signal_name, rfft=rfft) * 2. * phasor
+    bpf_signal = tod_ops.fourier_filter(aman, bpf, detrend=None,
+                                         signal_name=signal_name, rfft=rfft) * 2.
+    # Real and imaginary parts of bpf_signal * phasor, computed directly as
+    # contiguous real arrays rather than as strided views of a complex array.
+    demodQ = bpf_signal * phasor.real
+    if np.result_type(bpf_signal, phasor.imag) == bpf_signal.dtype:
+        demodU = np.multiply(bpf_signal, phasor.imag, out=bpf_signal)
+    else:
+        demodU = bpf_signal * phasor.imag
+    del bpf_signal
 
     # Filter the demodulated signal
     demod_aman = core.AxisManager(aman.dets, aman.samps)
     demod_aman.wrap("timestamps", aman.timestamps, axis_map=[(0, 'samps')])
     demod_aman.wrap("dsT", aman[signal_name].copy(), axis_map=[(0, 'dets'), (1, 'samps')])
     demod_aman["dsT"][:] = tod_ops.fourier_filter(demod_aman, lpf, signal_name='dsT', detrend=None, rfft=rfft)
-    demod_aman.wrap("demodQ", demod.real, axis_map=[(0, 'dets'), (1, 'samps')])
+    demod_aman.wrap("demodQ", demodQ, axis_map=[(0, 'dets'), (1, 'samps')])
     demod_aman["demodQ"][:] = tod_ops.fourier_filter(demod_aman, lpf, signal_name="demodQ", detrend=None, rfft=rfft)
-    demod_aman.wrap("demodU", demod.imag, axis_map=[(0, 'dets'), (1, 'samps')])
+    demod_aman.wrap("demodU", demodU, axis_map=[(0, 'dets'), (1, 'samps')])
     demod_aman["demodU"][:] = tod_ops.fourier_filter(demod_aman, lpf, signal_name="demodU", detrend=None, rfft=rfft)
 
     # Destroy the RFFT object
