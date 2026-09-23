@@ -245,10 +245,32 @@ def _ranges_match( o, n, oidx, nidx):
     """align Ranges n to Ranges o"""
     assert len(oidx)==len(nidx)
     assert len(oidx)==1
+    osl, nsl = oidx[0], nidx[0]
+    if isinstance(osl, slice) and isinstance(nsl, slice):
+        a, b, ostep = osl.indices(o.count)
+        c, d, nstep = nsl.indices(n.count)
+        if ostep == 1 and nstep == 1 and b - a == d - c:
+            return _ranges_splice(o, n, a, b, c)
     omsk = o.mask()
     nmsk = n.mask()
-    omsk[oidx[0]] = nmsk[nidx[0]]
+    omsk[osl] = nmsk[nsl]
     return Ranges.from_mask(omsk)
+
+def _ranges_splice(o, n, a, b, c):
+    """Replace samples [a, b) of Ranges o by samples [c, c + b - a) of
+    Ranges n, working on the intervals rather than on full masks."""
+    ro = o.ranges()
+    rn = n.ranges()
+    d = c + b - a
+    left = ro[ro[:, 0] < a]
+    left[:, 1] = np.minimum(left[:, 1], a)
+    right = ro[ro[:, 1] > b]
+    right[:, 0] = np.maximum(right[:, 0], b)
+    mid = rn[(rn[:, 1] > c) & (rn[:, 0] < d)]
+    mid = np.clip(mid, c, d) - c + a
+    # Pieces are sorted and disjoint; from_array merges adjacent intervals.
+    rows = np.concatenate([left, mid, right]).astype(np.int32)
+    return Ranges.from_array(rows.reshape(-1, 2), o.count)
 
 def _intersect(new, out):
     '''Get detector and samples intersection between ``new`` and ``out``.'''
