@@ -204,7 +204,20 @@ def _interp_model(x, xp, fp, out, rows, chunk=4096):
     return out
 
 
-def fit_azss(az, azss_stats, max_mode, modes_axis_name='azss_modes', fit_range=None, overwrite=False):
+def _subtract_model(signal, model, scan_flags):
+    """
+    In-place ``signal[:, scan_flags] -= model[:, scan_flags]``, without the
+    fancy-indexing and dtype conversion temporaries.
+    """
+    if scan_flags.all():
+        np.subtract(signal, model, out=signal, casting='same_kind')
+    else:
+        np.subtract(signal, model, out=signal, where=scan_flags[None, :],
+                    casting='same_kind')
+
+
+def fit_azss(az, azss_stats, max_mode, modes_axis_name='azss_modes', fit_range=None, overwrite=False,
+             dtype=np.float64):
     """
     Function for fitting Legendre polynomials to signal binned in azimuth.
 
@@ -227,6 +240,8 @@ def fit_azss(az, azss_stats, max_mode, modes_axis_name='azss_modes', fit_range=N
         If overwrite is true will refit the data even if the fit parameters are
         already stored in azss_stats. If False will just use the stored
         parameters in azss_stats to compute and return the model.
+    dtype: numpy dtype, optional
+        Data type of the returned model. Default is float64.
 
     Returns
     -------
@@ -242,7 +257,7 @@ def fit_azss(az, azss_stats, max_mode, modes_axis_name='azss_modes', fit_range=N
     # Number of valid bins cannot be smaller than mode of Legendre function.
     valid_dets = _valid_dets_mask(azss_stats, min_valid_bins=max_mode + 1)
 
-    model = np.zeros((ndets, len(az)))
+    model = np.zeros((ndets, len(az)), dtype=dtype)
     coeffs = np.zeros((ndets, max_mode + 1))
     binned_model = np.full((ndets, nbins), np.nan)
     sum_of_squares = np.full(ndets, np.nan)
@@ -319,7 +334,7 @@ def get_azss(aman, signal='signal', az=None, azrange=None, bins=100, flags=None,
              method='interpolate', max_mode=None, modes_axis_name='azss_modes', subtract_in_place=False,
              merge_stats=True, azss_stats_name='azss_stats',
              merge_model=True, azss_model_name='azss_model', coverage_threshold=0.95,
-             exclude_turnarounds=True, return_det_mask=False):
+             exclude_turnarounds=True, return_det_mask=False, model_dtype=np.float64):
     """
     Derive azss (Azimuth Synchronous Signal) statistics and model from the given axismanager data.
     **NOTE:** This function does not modify the ``signal`` unless ``subtract_in_place = True``.
@@ -391,6 +406,9 @@ def get_azss(aman, signal='signal', az=None, azrange=None, bins=100, flags=None,
         Exclude turnarounds when checking coverage. Default True
     return_det_mask: bool, optional
         If True, return detector mask along with model. Default False
+    model_dtype: numpy dtype, optional
+        Data type of the returned azss model. Default is float64; passing the
+        signal dtype halves the memory used by the model.
 
     Returns
     -------
@@ -427,7 +445,7 @@ def get_azss(aman, signal='signal', az=None, azrange=None, bins=100, flags=None,
 
     if apply_prefilt:
         # This requires signal to be a string.
-        signal = np.array(tod_ops.fourier_filter(
+        signal = np.asarray(tod_ops.fourier_filter(
                 aman, prefilt, detrend=prefilt_detrend, signal_name=signal_name)
                 )
 
@@ -457,19 +475,21 @@ def get_azss(aman, signal='signal', az=None, azrange=None, bins=100, flags=None,
                                                 exclude_turnarounds=exclude_turnarounds)
         azss_stats.wrap('bad_dets', bad_dets, [(0, 'dets')])
         azss_stats.wrap('az_coverage', coverages, [(0, 'dets')])
-    model_sig_tod = get_azss_model(aman, azss_stats, az, method, max_mode, modes_axis_name, azrange)
+    model_sig_tod = get_azss_model(aman, azss_stats, az, method, max_mode, modes_axis_name, azrange,
+                                   dtype=model_dtype)
 
     if merge_stats:
         aman.wrap(azss_stats_name, azss_stats)
     if merge_model:
         aman.wrap(azss_model_name, model_sig_tod, [(0, 'dets'), (1, 'samps')])
     if subtract_in_place:
-        aman[signal_name][:, scan_flags] -= model_sig_tod.astype(signal.dtype)[:, scan_flags]
+        _subtract_model(aman[signal_name], model_sig_tod, scan_flags)
     return azss_stats, model_sig_tod
 
 
 def get_azss_model(aman, azss_stats, az=None, method='interpolate',
-                   max_mode=None, modes_axis_name='azss_modes', azrange=None):
+                   max_mode=None, modes_axis_name='azss_modes', azrange=None,
+                   dtype=np.float64):
     """
     Function to return the azss template for subtraction given the azss_stats AxisManager
 
@@ -489,6 +509,8 @@ def get_azss_model(aman, azss_stats, az=None, method='interpolate',
         The name assigned to the LabelAxis of azss legendre modes when method is 'fit'.
     azrange: list, optional
         Azimuth range for fitting
+    dtype: numpy dtype, optional
+        Data type of the returned model. Default is float64.
 
     Returns
     -------
@@ -503,10 +525,10 @@ def get_azss_model(aman, azss_stats, az=None, method='interpolate',
             raise ValueError('max_mode is not provided as integer')
         model = fit_azss(
             az=az, azss_stats=azss_stats, max_mode=max_mode,
-            modes_axis_name=modes_axis_name, fit_range=azrange)
+            modes_axis_name=modes_axis_name, fit_range=azrange, dtype=dtype)
 
     if method == 'interpolate':
-        model = np.zeros((aman.dets.count, aman.samps.count))
+        model = np.zeros((aman.dets.count, aman.samps.count), dtype=dtype)
 
         valid_dets = _valid_dets_mask(azss_stats, min_valid_bins=1)
         if not valid_dets.any():
@@ -587,7 +609,8 @@ def subtract_azss(aman, azss_stats, signal='signal', method='interpolate', max_m
         raise TypeError("Signal must be None, str, or ndarray")
 
     model = get_azss_model(aman, azss_stats, method=method, max_mode=max_mode,
-                           modes_axis_name=modes_axis_name, azrange=azrange)
+                           modes_axis_name=modes_axis_name, azrange=azrange,
+                           dtype=signal.dtype)
 
     if scan_flags is None:
         scan_flags = np.ones(aman.samps.count, dtype=bool)
@@ -597,10 +620,7 @@ def subtract_azss(aman, azss_stats, signal='signal', method='interpolate', max_m
         scan_flags = scan_flags.mask()
 
     if in_place:
-        if signal_name is None:
-            signal[:, scan_flags] -= model.astype(signal.dtype)[:, scan_flags]
-        else:
-            aman[signal_name][:, scan_flags] -= model.astype(aman[signal_name].dtype)[:, scan_flags]
+        _subtract_model(signal, model, scan_flags)
     else:
         subtracted = signal[:, scan_flags] - model.astype(signal.dtype)[:, scan_flags]
         aman.wrap(subtract_name, subtracted, [(0, 'dets'), (1, 'samps')])

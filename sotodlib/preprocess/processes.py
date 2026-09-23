@@ -1461,9 +1461,14 @@ class AzSS(_Preprocess):
             return aman, proc_aman
 
         if self.process_cfgs.get("subtract"):
+            # The model is only subtracted, so build it in the signal dtype.
+            subtract_cfgs = {
+                'model_dtype': aman[self.calc_cfgs.get('signal', 'signal')].dtype,
+                **self.calc_cfgs,
+            }
             if self.calc_cfgs.get('azss_stats_name') in proc_aman:
                 if sim:
-                    tod_ops.azss.get_azss(aman, subtract_in_place=True, **self.calc_cfgs)
+                    tod_ops.azss.get_azss(aman, subtract_in_place=True, **subtract_cfgs)
                 else:
                     tod_ops.azss.subtract_azss(
                         aman,
@@ -1476,7 +1481,7 @@ class AzSS(_Preprocess):
                         in_place=True
                     )
             else:
-                tod_ops.azss.get_azss(aman, subtract_in_place=True, **self.calc_cfgs)
+                tod_ops.azss.get_azss(aman, subtract_in_place=True, **subtract_cfgs)
         else:
             tod_ops.azss.get_azss(aman, **self.calc_cfgs)
         return aman, proc_aman
