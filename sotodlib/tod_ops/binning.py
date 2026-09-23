@@ -118,15 +118,17 @@ def bin_signal(aman, bin_by, signal=None,
 
     for i in np.arange(ndets):
         m = mask[i]
-        w = weights[i]
+        idx = bin_indices[m]
+        w = weights[i][m]
+        sw = signal[i][m] * w
 
-        bin_counts[i] = np.bincount(bin_indices[m], weights=w[m], minlength=nbins)
+        bin_counts[i] = np.bincount(idx, weights=w, minlength=nbins)
         mcnts = bin_counts[i] > 0
         binned_signal[i][mcnts] = np.bincount(
-            bin_indices[m], weights=signal[i][m] * w[m], minlength=nbins
+            idx, weights=sw, minlength=nbins
         )[mcnts] / bin_counts[i][mcnts]
         binned_signal_squared_mean[i][mcnts] = np.bincount(
-            bin_indices[m], weights=(signal[i][m] * w[m])**2, minlength=nbins
+            idx, weights=sw**2, minlength=nbins
         )[mcnts] / bin_counts[i][mcnts]
         binned_signal_sigma[i][mcnts] = np.sqrt(
             np.abs(binned_signal_squared_mean[i, mcnts] - binned_signal[i, mcnts]**2)
