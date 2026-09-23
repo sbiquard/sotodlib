@@ -6,6 +6,7 @@ import scipy.signal as signal
 import logging
 
 from . import detrend_tod
+from .detrend import _detrend_array
 from . import fft_ops
 from sotodlib import core
 
@@ -82,7 +83,15 @@ def fourier_filter(tod, filt_function,
     else:
         raise ValueError('resize must be "zero_pad", "trim", or None')
 
-    if detrend is not None:
+    # When the whole float32 signal fits in the FFT buffer, detrend it there
+    # rather than in a separate full-size copy.
+    detrend_in_buffer = (
+        detrend is not None
+        and n >= axis.count
+        and tod[signal_name].dtype == np.float32
+        and not isinstance(filt_function, identity_filter)
+    )
+    if detrend is not None and not detrend_in_buffer:
         logger.info('fourier_filter: detrending.')
         signal = detrend_tod(tod, detrend, axis_name=axis_name,
                              signal_name=signal_name, in_place=False)
@@ -114,6 +123,9 @@ def fourier_filter(tod, filt_function,
         logger.info('fourier_filter: copying in data.')
         rfft.a[:,:min(n, axis.count)] = signal[:,:min(n, axis.count)]
         rfft.a[:,min(n, axis.count):] = 0
+        if detrend_in_buffer:
+            logger.info('fourier_filter: detrending.')
+            _detrend_array(rfft.a[:, :axis.count], method=detrend)
 
         ## FFT Signal
         logger.info('fourier_filter: FFT.')

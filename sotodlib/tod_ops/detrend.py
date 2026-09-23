@@ -62,6 +62,27 @@ def detrend_tod(
         axis_reorder[axis_idx], axis_reorder[-1] = -1, axis_idx
         signal = signal.transpose(tuple(axis_reorder))
 
+    _detrend_array(signal, method=method, count=count)
+
+    if axis_idx != signal.ndim - 1:
+        signal = signal.transpose(tuple(axis_reorder))
+
+    assert signal.dtype == dtype_in
+
+    if wrap_name is not None:
+        axis_map = [(i, x) for i, x in enumerate(tod._assignments[signal_name])]
+        tod.wrap(wrap_name, signal, axis_map)
+
+    return signal
+
+
+def _detrend_array(signal, method="linear", count=10):
+    """Detrend ``signal`` in place along its last axis.
+
+    See ``detrend_tod`` for the meaning of ``method`` and ``count``.
+    """
+    dtype_in = signal.dtype
+    n_samps = signal.shape[-1]
     if method == "mean":
         signal -= np.mean(signal, axis=-1)[..., None]
     elif method == "median":
@@ -82,14 +103,4 @@ def detrend_tod(
         signal -= np.mean(signal, axis=-1)[..., None]
     else:
         raise ValueError("method flag must be linear, mean, or median")
-
-    if axis_idx != signal.ndim - 1:
-        signal = signal.transpose(tuple(axis_reorder))
-
-    assert signal.dtype == dtype_in
-
-    if wrap_name is not None:
-        axis_map = [(i, x) for i, x in enumerate(tod._assignments[signal_name])]
-        tod.wrap(wrap_name, signal, axis_map)
-
     return signal
